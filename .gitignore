@@ -129,3 +129,8 @@ logs
 log
 outputs
 .history
+# three-mode-routing: generated data, run logs, checkpoints
+data/
+*.log
+slurm-*.out
+wandb/
