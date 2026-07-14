@@ -17,7 +17,126 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "RolloutCorrectionConfig",
+    "ThreeModeRoutingConfig",
+]
+
+
+@dataclass
+class ThreeModeRoutingConfig(BaseConfig):
+    """Configuration for adaptive three-mode self-routing GRPO (NOTHINK / SHORT / LONG).
+
+    The model freely emits NOTHINK, SHORT, or LONG as the first response token.
+    Routing is learned via a shaped reward surface — no auxiliary loss.
+
+    Field semantics are documented in detail on the runtime dataclass
+    ``verl.trainer.ppo.three_mode_routing.ThreeModeRoutingConfig`` (same fields,
+    same defaults) and in the config block ``algorithm.three_mode_routing`` in
+    ``ppo_trainer.yaml``.
+
+    Args:
+        enable (bool): Master switch (also set algorithm.adv_estimator=three_mode_routing).
+        nothink_token (str): Routing word for "answer directly" mode.
+        short_token (str): Routing word for "brief reasoning" mode.
+        long_token (str): Routing word for "extended reasoning" mode.
+        routing_question (str): Suffix injected into the last user message before generation.
+        nothink_base (float): Reward base for correct NOTHINK answers.
+        short_base (float): Reward base for correct SHORT answers.
+        long_base (float): Reward base for correct LONG answers.
+        gamma_nothink (float): Per-token discount for NOTHINK (reward = base * gamma^L).
+        gamma_short (float): Per-token discount for SHORT.  gamma=1.0 = no discount.
+        gamma_long (float): Per-token discount for LONG (default 1.0 = no discount).
+        reasoning_only (bool): If True, L is the token count before the first closing
+            </think> tag instead of the full response length.  Requires a tokenizer.
+        unknown_penalty (float): Reward override when no valid routing token is emitted.
+        nothink_wrong_penalty (float): Reward for incorrect NOTHINK answers (default 0.0).
+        short_wrong_penalty (float): Reward for incorrect SHORT answers (default 0.0).
+        long_wrong_penalty (float): Reward for incorrect LONG answers (default 0.0).
+        enabled_modes (str): Active modes, comma string (subset of "nothink,short,long").
+        warmup_steps (int): Phase-1 end — n//4 forced rollouts per mode + remainder free.
+        warmup2_steps (int): Phase-2 end (0 = disabled) — 1 forced per mode + remainder free.
+        n_rollouts (int): Total group size G (forced+free during warmup, all-free after).
+        nothink_max_tokens (Optional[int]): Hard cap on NOTHINK-routed response length (tokens).
+            Applied post-rollout before reward so over-cap responses score wrong.  None = no cap.
+        short_max_tokens (Optional[int]): Hard cap on SHORT-routed response length.
+        long_max_tokens (Optional[int]): Hard cap on LONG-routed response length.
+        balance_coef (float): Strength of the whole-batch balance term (advantage level).
+        balance_target (float): Target fraction for each mode (1/3 for equal three-way split).
+        balance_anneal_start_step (int): Linear balance_coef anneal start (0/0 = disabled).
+        balance_anneal_end_step (int): Linear balance_coef anneal end.
+        balance_anneal_final_coef (float): Balance coef after the anneal ends.
+        balance_correctness_gated (bool): Positive nudges only on correct rollouts,
+            negative nudges only on wrong ones.
+        balance_protect_long_incorrect (bool): Wrong LONG rollouts never receive a
+            balance nudge (hard problems stay free to route LONG).
+        solved_gate_warmup_steps (int): For global_steps <= this, gate unknown_penalty and
+            balance term on solved groups only (>=1 correct answer). 0 = gate never active.
+        val_forced_mode (str): Forced routing mode for validation ("" = free).
+        train_forced_mode (str): Forced mode for ALL training rollouts (ablation; "" = normal).
+        strict_token_boundary (bool): Require a word boundary after the routing word in
+            detection (not recommended; prefix/token-id matching is the default).
+        balance_free_only (bool): Compute/apply the balance term over free rollouts only.
+        exclude_unknown_from_mean (bool): Exclude unknown rollouts from the group mean.
+        exclude_unknown_from_mean_start_step (int): Step from which the exclusion applies.
+        apply_caps_in_validation (bool): Apply the per-mode caps before scoring validation.
+        two_pass_enable (bool): Two-pass free rollouts (pass 1 reads the routing word,
+            pass 2 continues with the mode's remaining budget).
+        router_pass_tokens (int): Pass-1 token budget.
+        unknown_early_stop (bool): Skip pass 2 for unknown-routed rollouts.
+        two_pass_debug (bool): Print stitched rollout samples each step.
+        two_pass_debug_n (int): Number of samples to print per step.
+    """
+
+    enable: bool = False
+    nothink_token: str = "NOTHINK"
+    short_token: str = "SHORT"
+    long_token: str = "LONG"
+    routing_question: str = (
+        "\n\nOutput NOTHINK to answer directly, SHORT for brief reasoning, "
+        "or LONG for extended reasoning: "
+    )
+    nothink_base: float = 2.0
+    short_base: float = 1.5
+    long_base: float = 1.0
+    gamma_nothink: float = 0.99984
+    gamma_short: float = 0.999912
+    gamma_long: float = 1.0
+    reasoning_only: bool = False
+    unknown_penalty: float = -0.5
+    nothink_wrong_penalty: float = 0.0
+    short_wrong_penalty: float = 0.0
+    long_wrong_penalty: float = 0.0
+    enabled_modes: str = "nothink,short,long"
+    warmup_steps: int = 100
+    warmup2_steps: int = 0
+    n_rollouts: int = 4
+    nothink_max_tokens: Optional[int] = None
+    short_max_tokens: Optional[int] = None
+    long_max_tokens: Optional[int] = None
+    balance_coef: float = 0.5
+    balance_target: float = 1.0 / 3.0
+    balance_anneal_start_step: int = 0
+    balance_anneal_end_step: int = 0
+    balance_anneal_final_coef: float = 0.0
+    balance_correctness_gated: bool = False
+    balance_protect_long_incorrect: bool = False
+    solved_gate_warmup_steps: int = 0
+    val_forced_mode: str = ""
+    train_forced_mode: str = ""
+    strict_token_boundary: bool = False
+    balance_free_only: bool = True
+    exclude_unknown_from_mean: bool = True
+    exclude_unknown_from_mean_start_step: int = 0
+    apply_caps_in_validation: bool = False
+    two_pass_enable: bool = False
+    router_pass_tokens: int = 8
+    unknown_early_stop: bool = True
+    two_pass_debug: bool = False
+    two_pass_debug_n: int = 2
 
 
 @dataclass
@@ -467,6 +586,7 @@ class AlgoConfig(BaseConfig):
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
+        three_mode_routing (Optional[ThreeModeRoutingConfig]): Adaptive three-mode self-routing GRPO settings.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
             Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
 
@@ -493,6 +613,7 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    three_mode_routing: Optional[ThreeModeRoutingConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

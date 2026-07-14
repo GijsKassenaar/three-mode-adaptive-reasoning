@@ -18,6 +18,7 @@ A unified tracking interface that supports logging data to different backend
 import dataclasses
 import json
 import os
+import atexit
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -59,6 +60,7 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._finished = False
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -157,18 +159,30 @@ class Tracking:
         if "file" in default_backend:
             self.logger["file"] = FileLogger(project_name, experiment_name)
 
+        atexit.register(self.finish)
+
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
-    def __del__(self):
+    def finish(self, exit_code=0):
+        if self._finished:
+            return
+
+        self._finished = True
+
+        try:
+            atexit.unregister(self.finish)
+        except Exception:
+            pass
+
         if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
+            self.logger["wandb"].finish(exit_code=exit_code)
         if "swanlab" in self.logger:
             self.logger["swanlab"].finish()
         if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
+            self.logger["vemlp_wandb"].finish(exit_code=exit_code)
         if "tensorboard" in self.logger:
             self.logger["tensorboard"].finish()
         if "clearml" in self.logger:
@@ -177,6 +191,12 @@ class Tracking:
             self.logger["trackio"].finish()
         if "file" in self.logger:
             self.logger["file"].finish()
+
+    def __del__(self):
+        try:
+            self.finish(exit_code=0)
+        except Exception:
+            pass
 
 
 class ClearMLLogger:
