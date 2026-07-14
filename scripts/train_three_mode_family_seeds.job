@@ -1,0 +1,314 @@
+#!/bin/bash
+# Job array: {forced NOTHINK, forced SHORT, forced LONG, adaptive balgated} x 2 NEW data
+# seeds = 8 runs, one Slurm array task each (throttled to 1 concurrent via %1).
+#
+# Only 2 seeds per config, not 3: each config already has one existing/queued run with no
+# explicit seed override (train_forced_single_mode_math.job x3 and the fresh 0->45
+# balgated run, see reports/three_mode_routing_addendum_2026-07-08.md) -- that existing run
+# effectively used the framework's own defaults (actor.data_loader_seed=1,
+# actor/ref fsdp_config.seed=42; data.seed itself was left null / unseeded). This script
+# adds 2 MORE seeded runs per config on top of that. Default new seeds are 2,3 --
+# deliberately skipping 1, since 1 is verl's own default actor.data_loader_seed (used
+# by the existing unseeded run), to keep every run's seed distinct from that default.
+#
+# Configs:
+#   - forced_nothink / forced_short / forced_long: every rollout forced into that one mode
+#     for the whole run, n_rollouts=4, 45 steps, single phase -- unchanged from
+#     train_forced_single_mode_math.job's recipe (bases 1.3/1.2/1.0, gamma_nothink=0.99984,
+#     gamma_short=0.99994, gamma_long=1.0, reasoning_only=True, both balance flags).
+#   - balgated: free/adaptive three-mode routing, n_rollouts=8, FULL 90-STEP run in TWO
+#     PHASES within the same task/allocation, replicating jobs 24314950+24329987 from the
+#     addendum report:
+#       phase 1 (fresh start, steps 1-60):  "0.792 recipe" gammas/bases (1.3/1.2/1.0,
+#                                            gamma_nothink=0.99984, gamma_short=0.99994)
+#       phase 2 (resume from step 60, steps 61-90): gammas/bases flattened to 1.0/1.0/1.0
+#                                            (caps + balance term only, no differential
+#                                            reward) -- exactly the ablation job B ran.
+#     Both phases keep reasoning_only=True, balance_correctness_gated=True,
+#     balance_protect_long_incorrect=True throughout.
+#
+# Data seed wiring: data.seed drives the train_dataloader's RandomSampler (which batches
+# get shuffled into which step -- see verl/trainer/main_ppo.py::create_rl_sampler).
+# actor/ref fsdp_config.seed and actor.data_loader_seed are set alongside it for full
+# reproducibility of the run's random draws (mirrors scripts/train_comparison_4methods_3seeds.job).
+#
+# Usage:
+#   sbatch scripts/train_three_mode_family_seeds.job
+#   SEEDS_CSV=7,13 sbatch scripts/train_three_mode_family_seeds.job   # override seeds (avoid 1!)
+#   DRY_RUN=1 sbatch scripts/train_three_mode_family_seeds.job        # preview only, no training
+# To (re)run a single task locally instead of the whole array:
+#   SLURM_ARRAY_TASK_ID=0 bash scripts/train_three_mode_family_seeds.job
+#
+# Task layout (TASK_ID = config_idx * 2 + seed_idx):
+#   0-1  forced_nothink  seeds[0..1]
+#   2-3  forced_short    seeds[0..1]
+#   4-5  forced_long     seeds[0..1]
+#   6-7  balgated        seeds[0..1]  (each task runs BOTH 60-step and 90-step phases)
+#
+# Checkpoints: /scratch-shared/$USER/three_mode_routing_ckpts/<experiment_name> (home quota is tight)
+# Logs: <experiment_name>.log (forced_*), <experiment_name>_phase{1,2}.log (balgated).
+
+#SBATCH --job-name=tmr_3mode_family_2seeds
+#SBATCH --partition=gpu_h100
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=600G
+#SBATCH --time=08:00:00
+#SBATCH --array=0-7%1
+
+module purge
+module load 2025
+module load CUDA/12.8.0
+
+source ~/.bashrc
+conda activate zero
+
+set -euo pipefail
+
+unset ROCR_VISIBLE_DEVICES
+unset HIP_VISIBLE_DEVICES
+
+export HF_HOME=/scratch-shared/$USER/huggingface
+mkdir -p "$HF_HOME"
+export WANDB__SERVICE_WAIT=300
+export WANDB_DIR=/scratch-shared/$USER/wandb
+mkdir -p "$WANDB_DIR"
+
+cd "${REPO_DIR:-$HOME/three-mode-routing}"
+
+export N_GPUS=${N_GPUS:-4}
+export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
+export BASE_MODEL=${BASE_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
+export DATA_DIR=${DATA_DIR:-"$PWD/data/math_lighteval"}
+export TRAIN_FILE="$DATA_DIR/train.parquet"
+export VAL_FILE="$DATA_DIR/dev.parquet"
+
+# Override via SEEDS_CSV. Avoid 1 -- it's verl's own default actor.data_loader_seed,
+# already implicitly used by the existing unseeded run for each config.
+SEEDS_CSV=${SEEDS_CSV:-2,3}
+IFS=',' read -r -a SEEDS <<< "$SEEDS_CSV"
+for s in "${SEEDS[@]}"; do
+    if [[ "$s" == "1" ]]; then
+        echo "ERROR: seed 1 collides with verl's default actor.data_loader_seed -- pick a different seed." >&2
+        exit 1
+    fi
+done
+
+CONFIGS=(forced_nothink forced_short forced_long balgated)
+
+TOTAL_TASKS=$(( ${#CONFIGS[@]} * ${#SEEDS[@]} ))
+TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
+
+if (( TASK_ID < 0 || TASK_ID >= TOTAL_TASKS )); then
+    echo "Invalid task id ${TASK_ID}. Expected 0..$((TOTAL_TASKS - 1))." >&2
+    exit 1
+fi
+
+CONFIG_IDX=$(( TASK_ID / ${#SEEDS[@]} ))
+SEED_IDX=$(( TASK_ID % ${#SEEDS[@]} ))
+CONFIG=${CONFIGS[$CONFIG_IDX]}
+SEED=${SEEDS[$SEED_IDX]}
+
+case "$CONFIG" in
+    forced_nothink) MODE_LC=nothink ;;
+    forced_short)   MODE_LC=short ;;
+    forced_long)    MODE_LC=long ;;
+    balgated)       MODE_LC="" ;;
+    *)
+        echo "Unknown config: $CONFIG" >&2
+        exit 1
+        ;;
+esac
+
+if [[ "$CONFIG" == "balgated" ]]; then
+    EXPERIMENT_NAME="balgated_adaptive_math_seed${SEED}"
+else
+    EXPERIMENT_NAME="forced_${MODE_LC}_math_seed${SEED}"
+fi
+
+CKPT_DIR=/scratch-shared/$USER/three_mode_routing_ckpts/$EXPERIMENT_NAME
+mkdir -p "$CKPT_DIR"
+
+echo "===================================================="
+echo "Task           : $TASK_ID / $((TOTAL_TASKS - 1))"
+echo "Config         : $CONFIG"
+echo "Seed           : $SEED"
+echo "Experiment     : $EXPERIMENT_NAME"
+echo "Checkpoint dir : $CKPT_DIR"
+echo "===================================================="
+
+DRY_RUN=${DRY_RUN:-0}
+
+# Args shared by every run regardless of config or phase.
+BASE_ARGS=(
+    "data.train_files=$TRAIN_FILE"
+    "data.val_files=$VAL_FILE"
+    "data.train_batch_size=128"
+    "data.val_batch_size=256"
+    "data.dataloader_num_workers=2"
+    "data.max_prompt_length=2048"
+    "data.max_response_length=16384"
+    "data.filter_overlong_prompts=True"
+    "data.seed=$SEED"
+
+    "actor_rollout_ref.model.path=$BASE_MODEL"
+    "actor_rollout_ref.model.use_remove_padding=True"
+    "actor_rollout_ref.actor.use_dynamic_bsz=True"
+    "actor_rollout_ref.actor.optim.lr=1e-6"
+    "actor_rollout_ref.actor.ppo_mini_batch_size=32"
+    "actor_rollout_ref.actor.ppo_micro_batch_size=8"
+    "actor_rollout_ref.actor.loss_agg_mode=token-mean"
+    "actor_rollout_ref.actor.policy_loss.loss_mode=vanilla"
+    "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480"
+    "actor_rollout_ref.actor.data_loader_seed=$SEED"
+    "actor_rollout_ref.actor.fsdp_config.seed=$SEED"
+    "actor_rollout_ref.rollout.prompt_length=2048"
+    "actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE"
+    "actor_rollout_ref.rollout.name=vllm"
+    "actor_rollout_ref.rollout.gpu_memory_utilization=0.5"
+    "actor_rollout_ref.rollout.log_prob_micro_batch_size=32"
+    "actor_rollout_ref.rollout.val_kwargs.temperature=0.6"
+    "actor_rollout_ref.rollout.val_kwargs.do_sample=True"
+    "actor_rollout_ref.rollout.val_kwargs.n=1"
+    "actor_rollout_ref.ref.log_prob_micro_batch_size=8"
+    "actor_rollout_ref.ref.fsdp_config.seed=$SEED"
+
+    "critic.enable=False"
+
+    "algorithm.adv_estimator=three_mode_routing"
+    "algorithm.gamma=1.0"
+    "algorithm.norm_adv_by_std_in_grpo=False"
+    "algorithm.use_kl_in_reward=False"
+    "algorithm.kl_ctrl.kl_coef=0.001"
+    "algorithm.three_mode_routing.enable=True"
+    "algorithm.three_mode_routing.nothink_token=NOTHINK"
+    "algorithm.three_mode_routing.short_token=SHORT"
+    "algorithm.three_mode_routing.long_token=LONG"
+    "algorithm.three_mode_routing.nothink_wrong_penalty=0.0"
+    "algorithm.three_mode_routing.short_wrong_penalty=0.0"
+    "algorithm.three_mode_routing.long_wrong_penalty=0.0"
+    "algorithm.three_mode_routing.reasoning_only=True"
+    "algorithm.three_mode_routing.unknown_penalty=-0.5"
+    "algorithm.three_mode_routing.exclude_unknown_from_mean=False"
+    "algorithm.three_mode_routing.warmup_steps=45"
+    "algorithm.three_mode_routing.warmup2_steps=0"
+    "algorithm.three_mode_routing.nothink_max_tokens=1024"
+    "algorithm.three_mode_routing.short_max_tokens=3000"
+    "algorithm.three_mode_routing.long_max_tokens=16384"
+    "algorithm.three_mode_routing.balance_coef=1.0"
+    "algorithm.three_mode_routing.balance_target=0.3333"
+    "algorithm.three_mode_routing.balance_correctness_gated=True"
+    "algorithm.three_mode_routing.balance_protect_long_incorrect=True"
+    "algorithm.three_mode_routing.two_pass_enable=False"
+
+
+    "trainer.n_gpus_per_node=$N_GPUS"
+    "trainer.nnodes=1"
+    "trainer.val_before_train=True"
+    "trainer.val_only=False"
+    'trainer.logger=["console","wandb"]'
+    "trainer.project_name=three-mode-routing"
+    "trainer.experiment_name=$EXPERIMENT_NAME"
+    "trainer.default_local_dir=$CKPT_DIR"
+)
+
+if [[ "$CONFIG" == "balgated" ]]; then
+    # ---- Phase 1: fresh start, "0.792 recipe" gammas/bases, steps 0 -> 60 ----
+    PHASE1_ARGS=(
+        "${BASE_ARGS[@]}"
+        "actor_rollout_ref.rollout.n=8"
+        "algorithm.three_mode_routing.n_rollouts=8"
+        "algorithm.three_mode_routing.nothink_base=1.3"
+        "algorithm.three_mode_routing.short_base=1.2"
+        "algorithm.three_mode_routing.long_base=1.0"
+        "algorithm.three_mode_routing.gamma_nothink=0.99984"
+        "algorithm.three_mode_routing.gamma_short=0.99994"
+        "algorithm.three_mode_routing.gamma_long=1.0"
+        "algorithm.three_mode_routing.balance_anneal_start_step=60"
+        "algorithm.three_mode_routing.balance_anneal_end_step=85"
+        "algorithm.three_mode_routing.balance_anneal_final_coef=0.0"
+        "trainer.resume_mode=auto"
+        "trainer.total_training_steps=60"
+        "trainer.save_freq=60"
+        "trainer.test_freq=15"
+    )
+
+    RESUME_CKPT="$CKPT_DIR/global_step_60"
+
+    # ---- Phase 2: resume from step 60, gammas/bases flattened to 1.0, steps 61 -> 90 ----
+    PHASE2_ARGS=(
+        "${BASE_ARGS[@]}"
+        "actor_rollout_ref.rollout.n=8"
+        "algorithm.three_mode_routing.n_rollouts=8"
+        "algorithm.three_mode_routing.nothink_base=1.0"
+        "algorithm.three_mode_routing.short_base=1.0"
+        "algorithm.three_mode_routing.long_base=1.0"
+        "algorithm.three_mode_routing.gamma_nothink=1.0"
+        "algorithm.three_mode_routing.gamma_short=1.0"
+        "algorithm.three_mode_routing.gamma_long=1.0"
+        "algorithm.three_mode_routing.balance_anneal_start_step=90"
+        "algorithm.three_mode_routing.balance_anneal_end_step=90"
+        "algorithm.three_mode_routing.balance_anneal_final_coef=0.0"
+        "trainer.resume_mode=resume_path"
+        "trainer.resume_from_path=$RESUME_CKPT"
+        "trainer.total_training_steps=90"
+        "trainer.save_freq=90"
+        "trainer.test_freq=15"
+    )
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "DRY_RUN=1 -> command preview only (no training started)."
+        echo "[phase 1] python3 -m verl.trainer.main_ppo ${PHASE1_ARGS[*]}"
+        echo "[phase 2] python3 -m verl.trainer.main_ppo ${PHASE2_ARGS[*]}"
+        exit 0
+    fi
+
+    echo "[$EXPERIMENT_NAME] phase 1/2: steps 0 -> 60, 0.792 recipe gammas/bases"
+    python3 -m verl.trainer.main_ppo \
+        "${PHASE1_ARGS[@]}" \
+        2>&1 | tee "${EXPERIMENT_NAME}_phase1.log"
+
+    if [ ! -d "$RESUME_CKPT/actor" ]; then
+        echo "ERROR: expected checkpoint $RESUME_CKPT/actor after phase 1, not found" >&2
+        exit 1
+    fi
+
+    echo "[$EXPERIMENT_NAME] phase 2/2: steps 60 -> 90, flat gammas/bases (caps + balance only)"
+    python3 -m verl.trainer.main_ppo \
+        "${PHASE2_ARGS[@]}" \
+        2>&1 | tee "${EXPERIMENT_NAME}_phase2.log"
+else
+    # Forced single-mode: unchanged 45-step single-phase recipe.
+    FORCED_ARGS=(
+        "${BASE_ARGS[@]}"
+        "actor_rollout_ref.rollout.n=4"
+        "algorithm.three_mode_routing.enabled_modes=$MODE_LC"
+        "algorithm.three_mode_routing.n_rollouts=4"
+        "algorithm.three_mode_routing.train_forced_mode=$MODE_LC"
+        "algorithm.three_mode_routing.val_forced_mode=$MODE_LC"
+        "algorithm.three_mode_routing.nothink_base=1.3"
+        "algorithm.three_mode_routing.short_base=1.2"
+        "algorithm.three_mode_routing.long_base=1.0"
+        "algorithm.three_mode_routing.gamma_nothink=0.99984"
+        "algorithm.three_mode_routing.gamma_short=0.99994"
+        "algorithm.three_mode_routing.gamma_long=1.0"
+        "algorithm.three_mode_routing.balance_anneal_start_step=90"
+        "algorithm.three_mode_routing.balance_anneal_end_step=90"
+        "algorithm.three_mode_routing.balance_anneal_final_coef=0.0"
+        "trainer.resume_mode=auto"
+        "trainer.total_training_steps=45"
+        "trainer.save_freq=45"
+        "trainer.test_freq=15"
+    )
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "DRY_RUN=1 -> command preview only (no training started)."
+        echo "python3 -m verl.trainer.main_ppo ${FORCED_ARGS[*]}"
+        exit 0
+    fi
+
+    python3 -m verl.trainer.main_ppo \
+        "${FORCED_ARGS[@]}" \
+        2>&1 | tee "${EXPERIMENT_NAME}.log"
+fi
