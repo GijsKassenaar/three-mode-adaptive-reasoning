@@ -89,7 +89,6 @@ scripts honour `REPO_DIR` (repo checkout), `DATA_DIR`, `BASE_MODEL`, and
 ```bash
 bash scripts/prepare_math_lighteval_math500.sh   # MATH-lighteval train + MATH-500 dev
 bash scripts/prepare_benchmarks.sh               # GSM8K, AIME 2024, AIME 2025 val sets
-bash scripts/prepare_bigmath_math500.sh          # (optional) Big-Math train, MATH-500 dev
 ```
 
 No routing-specific preprocessing exists — the routing question is injected at
@@ -119,8 +118,6 @@ Fresh start from `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`; two phases in one 
 | Script | What it isolates |
 |---|---|
 | `scripts/train_forced_single_mode_math.job` (`MODE=NOTHINK\|SHORT\|LONG`) | per-mode floor/ceiling: every rollout forced into one mode for the whole run, validation forced into the same mode |
-| `scripts/train_two_mode_nothink_long_math.job` (`SRC_CKPT=<ckpt>`) | drop SHORT, continue a trained checkpoint as a binary router |
-| `scripts/train_three_mode_routing_bigmath.job` | same recipe on the Big-Math-RL-Verified distribution |
 | `scripts/train_three_mode_family_seeds.job` | SLURM array: {forced-NOTHINK, forced-SHORT, forced-LONG, adaptive} × seeds |
 
 Flat-reward shaping (caps + balance only) is phase 2 of the main run; a caps-only

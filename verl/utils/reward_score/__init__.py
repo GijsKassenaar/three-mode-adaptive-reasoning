@@ -49,8 +49,6 @@ def default_compute_score(
         "lighteval/MATH",
         "DigitalLearningGmbH/MATH-lighteval",
         "HuggingFaceH4/MATH-500",
-        "agentica-org/DeepScaleR-Preview-Dataset",
-        "SynthLabsAI/Big-Math-RL-Verified",
         # Boxed val benchmarks (data/gsm8k, data/aime*): the routed model answers in
         # \boxed{}, so they use the boxed math_reward scorer — NOT the canonical
         # "openai/gsm8k" #### scorer or math_dapo's default "Answer:" pattern. This

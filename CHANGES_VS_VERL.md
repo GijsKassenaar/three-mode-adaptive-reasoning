@@ -12,7 +12,6 @@ commit of this repository is the unmodified verl v0.7.0 tree).
 | `verl/trainer/ppo/three_mode_routing.py` | Entire method core: `ThreeModeRoutingConfig` (runtime config), `RoutingPromptController` (routing-question injection, forced routing prefixes, routing-token promotion into the response head), `ThreeModeRoutingForcer` (phased forced/free rollout builder, per-mode `max_tokens`, optional two-pass free generation), `compute_three_mode_routing_advantage` (shaped rewards + group mean-centering + balance term), `compute_three_mode_routing_metrics`, `apply_three_mode_caps` |
 | `tests/trainer/ppo/test_three_mode_routing_on_cpu.py` | CPU unit tests for shaping, normalization, balance gating, detection, caps |
 | `examples/data_preprocess/math_lighteval.py` | MATH-lighteval → train/dev/test parquet; dev = MATH-500 (fixed indices) |
-| `examples/data_preprocess/bigmath.py` | Big-Math-RL-Verified train + MATH-500 dev |
 | `examples/data_preprocess/extra_benchmarks.py` | GSM8K / AIME'24 / AIME'25 val parquets (boxed format) |
 | `scripts/*.job`, `scripts/prepare_*.sh`, `scripts/plot_routing_split_by_difficulty.py` | SLURM training/ablation/eval jobs, data prep wrappers, figure script (see README) |
 
@@ -26,7 +25,7 @@ commit of this repository is the unmodified verl v0.7.0 tree).
 | `verl/trainer/config/ppo_trainer.yaml` | `algorithm.three_mode_routing:` block (fully commented) and a minimal `agent:` section with the `nothink` no-thinking-baseline toggle. |
 | `verl/trainer/ppo/metric_utils.py` | Reasoning-length accounting (`compute_reasoning_token_statistics` + helpers; tokens before the first `</think>`), correctness/reasoning splits in `compute_data_metrics` (optional `tokenizer` arg), `compute_completion_metrics` (truncated-vs-finished + per-group buckets), `compute_difficulty_metrics`. |
 | `verl/experimental/agent_loop/agent_loop.py` | `prefilled_prompt_mode`: generate verbatim from pre-tokenized prompt ids (`_run_prefilled_prompt`) — required for forced routing prefixes and routing-question injection, with `target_prompt_length`-aware padding; per-batch `meta_info["max_tokens"]` override (per-mode generation caps, two-pass budgets); `__skip_reward_compute__` (skip async reward for two-pass pass-2 continuation requests); empty-chunk dispatch guard; `agent.nothink` prompt suffix for the no-thinking baseline. |
-| `verl/utils/reward_score/__init__.py` | Boxed `math_reward` scorer extended to the datasets used here: MATH-lighteval mirrors, Big-Math, DeepScaleR, and the boxed-format `gsm8k` / `aime` / `aime2024` / `aime2025` val benchmarks. |
+| `verl/utils/reward_score/__init__.py` | Boxed `math_reward` scorer extended to the datasets used here: MATH-lighteval mirrors and the boxed-format `gsm8k` / `aime` / `aime2024` / `aime2025` val benchmarks. |
 
 ## Modified files — infrastructure fixes the runs depend on
 

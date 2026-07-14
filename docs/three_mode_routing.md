@@ -142,11 +142,9 @@ bug invisible to eyeballing.
 | Question | How |
 |---|---|
 | Per-mode ceiling/floor | `train_forced_single_mode_math.job` (train + val forced into one mode) |
-| Is SHORT needed? | `train_two_mode_nothink_long_math.job` (`enabled_modes="nothink,long"`) |
 | Reward shaping vs caps | phase 2 of the main run (bases/gammas = 1.0) |
 | Caps + shaping vs balance | add `balance_coef=0` to any of the above |
 | Seed robustness | `train_three_mode_family_seeds.job` |
-| Data distribution | `train_three_mode_routing_bigmath.job` |
 
 `enabled_modes` is fully reversible: disabled modes are not forced during warmup and a
 free rollout emitting a disabled mode's token is scored unknown (penalized), so the
