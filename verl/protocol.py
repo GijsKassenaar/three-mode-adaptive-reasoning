@@ -888,7 +888,12 @@ class DataProto:
 
         bsz_in_batch = None
         if self.batch is not None:
-            batch_lst = self.batch.chunk(chunks=chunks, dim=0)
+            batch_lst = list(self.batch.chunk(chunks=chunks, dim=0))
+            if len(batch_lst) < chunks:
+                # torch.chunk may return fewer chunks than requested when the leading
+                # dimension is smaller than `chunks`. Pad with empty chunks so tensor
+                # and non-tensor partitioning stay aligned.
+                batch_lst.extend([self.batch[:0] for _ in range(chunks - len(batch_lst))])
             bsz_in_batch = np.array([batch.batch_size[0] for batch in batch_lst])
             chunk_indices = np.cumsum(bsz_in_batch)[:-1]
         else:

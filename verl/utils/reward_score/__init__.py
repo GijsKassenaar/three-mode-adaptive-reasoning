@@ -45,7 +45,21 @@ def default_compute_score(
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
-    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
+    elif data_source in [
+        "lighteval/MATH",
+        "DigitalLearningGmbH/MATH-lighteval",
+        "HuggingFaceH4/MATH-500",
+        "agentica-org/DeepScaleR-Preview-Dataset",
+        "SynthLabsAI/Big-Math-RL-Verified",
+        # Boxed val benchmarks (data/gsm8k, data/aime*): the routed model answers in
+        # \boxed{}, so they use the boxed math_reward scorer — NOT the canonical
+        # "openai/gsm8k" #### scorer or math_dapo's default "Answer:" pattern. This
+        # exact-match elif is checked before the math_dapo startswith("aime") branch.
+        "gsm8k",
+        "aime",
+        "aime2024",
+        "aime2025",
+    ]:
         from . import math_reward
 
         res = math_reward.compute_score(solution_str, ground_truth)

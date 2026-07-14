@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    THREE_MODE_ROUTING = "three_mode_routing"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -326,6 +327,42 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.THREE_MODE_ROUTING)
+def _three_mode_routing_advantage_dispatch(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    routing_mode: Optional[np.ndarray] = None,
+    routing_token_length: Optional[np.ndarray] = None,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch wrapper so THREE_MODE_ROUTING fits the standard register_adv_est interface.
+
+    The estimator body lives in verl.trainer.ppo.three_mode_routing (imported lazily to
+    keep core_algos free of the routing module at import time).  The trainer supplies
+    routing_mode / routing_token_length / routing_forced / global_step via adv_kwargs
+    (see ray_trainer.compute_advantage).
+    """
+    from verl.trainer.ppo.three_mode_routing import compute_three_mode_routing_advantage
+
+    if routing_mode is None:
+        raise ValueError(
+            "routing_mode must be present in non_tensor_batch when using three_mode_routing estimator. "
+            "Enable algorithm.three_mode_routing.enable=True to activate rollout building."
+        )
+
+    return compute_three_mode_routing_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        routing_mode=routing_mode,
+        routing_token_length=routing_token_length,
+        config=config,
+        **kwargs,
+    )
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)

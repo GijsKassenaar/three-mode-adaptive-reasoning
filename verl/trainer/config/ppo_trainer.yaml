@@ -119,6 +119,176 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Adaptive three-mode self-routing GRPO (NOTHINK / SHORT / LONG).
+  # The model emits one routing word as its first response token; routing is learned
+  # through a shaped reward surface + per-mode hard token caps (no auxiliary loss).
+  # Implementation: verl/trainer/ppo/three_mode_routing.py
+  three_mode_routing:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.ThreeModeRoutingConfig
+
+    # Master switch (also set algorithm.adv_estimator=three_mode_routing).
+    enable: False
+
+    # Routing words the model emits as its first response token.
+    nothink_token: "NOTHINK"
+    short_token: "SHORT"
+    long_token: "LONG"
+
+    # Injected into the last user message before generation (runtime, no new parquet needed).
+    routing_question: "\n\nOutput NOTHINK to answer directly, SHORT for brief reasoning, or LONG for extended reasoning: "
+
+    # Reward bases for correct answers.
+    nothink_base: 2.0
+    short_base: 1.5
+    long_base: 1.0
+
+    # Per-token exponential discount (gamma^L).
+    # reward_correct = base * gamma^L where L = tokens after the routing token.
+    # Set crossovers at your token caps:
+    #   gamma_short   = (long_base / short_base)^(1/short_cap)
+    #   gamma_nothink = gamma_short * (short_base / nothink_base)^(1/nothink_cap)
+    # NOTE: these defaults follow the recipe for bases 1.4/1.3/1.0 with caps 1024/3000,
+    # NOT the default bases above (2.0/1.5/1.0).  Always set gammas together with bases.
+    # Keep gammas <= 1.0: a value > 1 rewards longer responses AND overflows base*gamma^L.
+    gamma_nothink: 0.99984
+    gamma_short: 0.999912
+    # Discount for LONG (1.0 = no discount, the original design).  <1 adds gentle
+    # length pressure within LONG as well.
+    gamma_long: 1.0
+
+    # When True, L (used for gamma^L above) is computed only from tokens before the
+    # first closing </think> tag instead of the full response length.  Requires a
+    # tokenizer.  Responses that never close </think> get L=0 (no discount).
+    reasoning_only: False
+
+    # Reward override when no valid routing word is emitted.
+    unknown_penalty: -0.5
+
+    # Reward for incorrect answers, per mode (default 0.0 = no penalty).
+    # Set nothink_wrong_penalty < 0 to create a risk-reward tradeoff:
+    # choosing an aggressive mode but getting it wrong costs more than falling back to LONG.
+    nothink_wrong_penalty: 0.0
+    short_wrong_penalty: 0.0
+    long_wrong_penalty: 0.0
+
+    # Rollout protocol:
+    #   phase 1 (0..warmup_steps):          n//4 forced per mode + remainder free
+    #   phase 2 (warmup_steps..warmup2_steps, if >warmup_steps): 1 forced per mode + remainder free
+    #   phase 3 (post-warmup2):             all n free
+    warmup_steps: 100
+    warmup2_steps: 0   # 0 = disabled; set > warmup_steps to enable phase 2
+    n_rollouts: 4      # total group size G
+
+    # Per-mode hard response caps (tokens).  Applied post-rollout before reward so a
+    # response that exceeds its mode's cap is scored wrong — mechanically separating
+    # modes so the router can learn from real correctness differences.  null = no cap.
+    nothink_max_tokens: null
+    short_max_tokens: null
+    long_max_tokens: null
+
+    # Balance term (advantage level): pushes the three-way mode split toward balance_target.
+    # Applied after group mean-centering in solved groups (or all groups post-gate warmup).
+    balance_coef: 0.5
+    balance_target: 0.3333  # ~1/3
+
+    # Linear annealing of balance_coef (0/0 = disabled, coef stays constant).
+    # Full balance_coef up to start_step, linearly interpolated to final_coef at
+    # end_step, constant final_coef afterwards.  Anneal to 0 after routing is
+    # established (e.g. start=45, end=75) to test whether the split is genuinely
+    # difficulty-calibrated rather than held at the target by the balance term.
+    # Logged as three_mode_routing/balance_coef_effective.
+    balance_anneal_start_step: 0
+    balance_anneal_end_step: 0
+    balance_anneal_final_coef: 0.0
+
+    # Gate the balance nudge by correctness: positive (encourage) nudges apply only to
+    # CORRECT rollouts, negative (discourage) nudges only to WRONG ones — so a correct
+    # answer in a popular mode is never pushed down. False = symmetric nudge.
+    balance_correctness_gated: False
+
+    # When True, LONG rollouts with an incorrect answer never receive a balance nudge, so the
+    # load-balancer never pushes the hardest (often-wrong) problems away from LONG. False = off.
+    balance_protect_long_incorrect: False
+
+    # Solved-group gate: for global_steps <= solved_gate_warmup_steps, gate the unknown_penalty
+    # and balance term on groups with >=1 correct answer only (anti-gaming bootstrap).
+    # After warmup ALL groups are shaped.  0 = gate never active.
+    solved_gate_warmup_steps: 0
+
+    # Forced mode for val_only evaluation runs.  "" = free (model chooses its own token).
+    # "nothink" / "short" / "long" = inject routing question + token into prompt so the
+    # model is forced into that mode.  Use with trainer.val_only=True to compare per-mode
+    # accuracy and length without stochastic routing noise.
+    val_forced_mode: ""
+
+    # Forced mode for TRAINING rollouts (ablation: fully-forced single-mode training).
+    # "" = normal phased forcing (n//4 forced per mode + free, per warmup_steps/warmup2_steps).
+    # "nothink" / "short" / "long" = every rollout, every step, forced into that one mode
+    # (no free/self-routing behaviour at all, for the whole run). Overrides enabled_modes
+    # for the forced loop. Use with trainer.val_only=False.
+    train_forced_mode: ""
+
+    # ── Detection / normalization behaviour flags.  Defaults are the recommended
+    # settings; each can be flipped to reproduce earlier behaviour. ──────────────
+
+    # True uses \b-bounded regex detection.  False (default) matches token ids /
+    # prefixes, so "LONGI need…" is not misclassified as unknown (a \b regex drops
+    # a large fraction of valid routing words with attached continuations).
+    strict_token_boundary: False
+
+    # True (default): balance-term fractions and nudges cover FREE rollouts only.
+    # False computes fractions over all rollouts (diluted toward the target by the
+    # forced rollouts during warmup, masking free-policy collapse).
+    balance_free_only: True
+
+    # True (default): unknown rollouts are excluded from the group mean, so a large
+    # unknown_penalty cannot give incorrect-but-valid groupmates positive advantage.
+    # False keeps the all-rollout mean.
+    exclude_unknown_from_mean: True
+
+    # Step from which exclude_unknown_from_mean takes effect (0 = immediately).
+    # The unknowns' drag on the group mean is what gives ALL forced routing tokens a
+    # positive advantage during warmup — the engine that bootstraps routing-word
+    # emission.  Excluding from step 1 can freeze the policy at unknown_fraction=1.0.
+    # Set past the forcing warmup (e.g. 30) when using large unknown penalties.
+    exclude_unknown_from_mean_start_step: 0
+
+    # True: per-mode caps are also applied before scoring at validation, matching
+    # the trained objective (diagnostic).  Default False: validation measures
+    # production behaviour (free generation, no truncation harness); a mode can
+    # then score slightly better at val than under the trained capped objective.
+    apply_caps_in_validation: False
+
+    # ── Two-pass free rollout generation (efficiency) ─────────────────────────────
+    # Pass 1 generates router_pass_tokens tokens to read the routing word; pass 2
+    # continues each rollout with exactly its mode's remaining budget
+    # (mode_cap - router_pass_tokens).  Caps become real generation stops instead of
+    # post-hoc truncation (no wasted tokens past a binding cap).  With
+    # unknown_early_stop, unknown-routed rollouts skip pass 2 entirely — their reward
+    # is a constant penalty regardless of content, so the continuation is pure waste
+    # and the penalty gradient concentrates on the routing decision itself.
+    # False = single-pass generation.
+    two_pass_enable: False
+    router_pass_tokens: 8
+    unknown_early_stop: True
+    two_pass_debug: False   # print stitched rollout samples each step
+    two_pass_debug_n: 4     # number of samples to print per step
+
+    # Active routing modes (comma string, subset of nothink,short,long). Default all
+    # three. Set "nothink,long" for a 2-mode router; disabled modes aren't forced and a
+    # free rollout emitting one scores as unknown. Set balance_target=1/n_modes.
+    enabled_modes: "nothink,short,long"
+
+# Rollout-time behaviour toggles (read by the agent loop)
+agent:
+
+  # Force `</think>\n\n` immediately after the generation prompt, so the model
+  # answers directly without any chain-of-thought reasoning.  Used to measure
+  # the 'no-thinking' accuracy baseline (see scripts/eval_nothink_baseline.job).
+  nothink: false
+
 # config for the trainer
 trainer:
 

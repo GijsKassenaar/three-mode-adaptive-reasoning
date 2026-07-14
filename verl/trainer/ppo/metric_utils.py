@@ -17,6 +17,7 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
+import re
 from typing import Any, Callable
 
 import numpy as np
@@ -24,6 +25,128 @@ import torch
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
+
+
+_THINKING_CLOSE_TAG_PATTERN = re.compile(r"</(?:think|thinking)>", re.IGNORECASE)
+
+
+def _tokenize_text_length(text: str, tokenizer: Any) -> int:
+    """Return token length for text without adding special tokens."""
+    if hasattr(tokenizer, "encode"):
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    tokenized = tokenizer(text, add_special_tokens=False, return_attention_mask=False)
+    return len(tokenized["input_ids"])
+
+
+def _extract_reasoning_spans(response_text: str) -> tuple[list[str], bool]:
+    """Extract reasoning text for prompt-prefilled <think> format.
+
+    The opening think tag is expected in the prompt prefix, so response text starts
+    inside think and ends reasoning at the first closing think tag.
+    """
+    close_match = _THINKING_CLOSE_TAG_PATTERN.search(response_text)
+    if close_match is not None:
+        prefix = response_text[: close_match.start()]
+        if prefix.strip():
+            return [prefix], True
+
+        return [], True
+
+    return [], False
+
+
+def _compute_reasoning_token_lengths(
+    batch: DataProto, response_length: torch.Tensor, tokenizer: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-sample reasoning token counts and whether reasoning is fully observed.
+
+    A sample is considered fully observed when either:
+    1) A closing think tag is present, or
+    2) The response is clipped at max response length without a closing think tag.
+    """
+    responses = batch.batch["responses"]
+    max_response_length = responses.size(1)
+    lengths = []
+    closed_think = []
+
+    for i in range(responses.size(0)):
+        valid_len = int(response_length[i].item())
+        if valid_len <= 0:
+            lengths.append(0.0)
+            closed_think.append(False)
+            continue
+
+        response_ids = responses[i, :valid_len].tolist()
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+
+        spans, has_close_tag = _extract_reasoning_spans(response_text)
+        reasoning_tokens = 0
+        reasoning_fully_observed = bool(has_close_tag)
+        if has_close_tag:
+            for span in spans:
+                reasoning_tokens += _tokenize_text_length(span, tokenizer)
+        elif valid_len >= max_response_length:
+            # Truncated at max length without a close tag: treat full response as reasoning.
+            reasoning_tokens = valid_len
+            reasoning_fully_observed = True
+
+        lengths.append(float(reasoning_tokens))
+        closed_think.append(reasoning_fully_observed)
+
+    return (
+        torch.tensor(lengths, dtype=torch.float32, device=response_length.device),
+        torch.tensor(closed_think, dtype=torch.bool, device=response_length.device),
+    )
+
+
+def compute_reasoning_token_statistics(
+    batch: DataProto,
+    tokenizer: Any,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute reasoning-token mask/statistics from prompt-prefilled think responses.
+
+    Used by three_mode_routing.reasoning_only: the gamma^L discount is then based on
+    the token count before the first closing </think> tag instead of the full
+    response length.  Responses that never close </think> get length 0 (no discount).
+
+    Returns:
+        reasoning_mask: Bool tensor of shape (bs, response_len_max) with reasoning tokens set True.
+        reasoning_lengths: Float tensor of shape (bs,) containing reasoning token counts K.
+        closed_think: Bool tensor of shape (bs,) indicating whether a closing think tag was found.
+        valid_response_lengths: Long tensor of shape (bs,) with valid response lengths from attention mask.
+    """
+    responses = batch.batch["responses"]
+    response_len_max = responses.size(1)
+    response_mask = batch.batch["attention_mask"][:, -response_len_max:]
+    valid_response_lengths = response_mask.sum(-1).to(dtype=torch.long)
+
+    reasoning_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+    reasoning_lengths = torch.zeros(responses.size(0), dtype=torch.float32, device=responses.device)
+    closed_think = torch.zeros(responses.size(0), dtype=torch.bool, device=responses.device)
+
+    for i in range(responses.size(0)):
+        valid_len = int(valid_response_lengths[i].item())
+        if valid_len <= 0:
+            continue
+
+        response_ids = responses[i, :valid_len].tolist()
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+
+        spans, has_close_tag = _extract_reasoning_spans(response_text)
+        closed_think[i] = bool(has_close_tag)
+        if not has_close_tag:
+            continue
+
+        reasoning_token_count = 0
+        for span in spans:
+            reasoning_token_count += _tokenize_text_length(span, tokenizer)
+
+        reasoning_token_count = min(int(reasoning_token_count), valid_len)
+        reasoning_lengths[i] = float(reasoning_token_count)
+        if reasoning_token_count > 0:
+            reasoning_mask[i, :reasoning_token_count] = True
+
+    return reasoning_mask, reasoning_lengths, closed_think, valid_response_lengths
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -77,7 +200,7 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+def compute_data_metrics(batch: DataProto, use_critic: bool = True, tokenizer: Any | None = None) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -98,8 +221,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - critic/values/mean, max, min: Statistics about critic values (if use_critic=True)
             - critic/vf_explained_var: Explained variance of the value function (if use_critic=True)
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
+            - response_length/mean_correct, mean_incorrect: Mean response length split by correctness
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
-            - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
+                        - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
+                        - response_length/mean_reasoning: Mean token length inside thinking tags
+                        - response_length/mean_reasoning_correct, mean_reasoning_incorrect:
+                            Mean reasoning token length split by correctness
+                        - response_length/incorrect_non_aborted_mean: Mean response length for incorrect,
+                            non-aborted samples
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
@@ -156,6 +285,54 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     else:
         raise ValueError("All samples are aborted, this should not happen.")
 
+    # Incorrect samples excluding aborted responses.
+    incorrect_mask = sequence_score < 0.5
+    correct_mask = ~incorrect_mask
+    correct_non_aborted_mask = correct_mask & non_aborted_mask
+    incorrect_non_aborted_mask = incorrect_mask & non_aborted_mask
+
+    correct_non_aborted_response_length = response_length[correct_non_aborted_mask]
+    if correct_non_aborted_response_length.numel() > 0:
+        correct_non_aborted_response_length_mean = torch.mean(correct_non_aborted_response_length).detach().item()
+    else:
+        correct_non_aborted_response_length_mean = 0.0
+
+    incorrect_non_aborted_response_length = response_length[incorrect_non_aborted_mask]
+    if incorrect_non_aborted_response_length.numel() > 0:
+        incorrect_non_aborted_response_length_mean = (
+            torch.mean(incorrect_non_aborted_response_length).detach().item()
+        )
+    else:
+        incorrect_non_aborted_response_length_mean = 0.0
+
+    # Mean token length inside <think>/<thinking> blocks, excluding aborted samples.
+    if tokenizer is not None:
+        reasoning_token_lengths, reasoning_closed_mask = _compute_reasoning_token_lengths(batch, response_length, tokenizer)
+        reasoning_valid_mask = non_aborted_mask & reasoning_closed_mask
+        valid_reasoning_lengths = reasoning_token_lengths[reasoning_valid_mask]
+        if valid_reasoning_lengths.numel() > 0:
+            mean_reasoning_length = torch.mean(valid_reasoning_lengths).detach().item()
+        else:
+            mean_reasoning_length = 0.0
+
+        reasoning_correct_mask = reasoning_valid_mask & correct_mask
+        valid_reasoning_lengths_correct = reasoning_token_lengths[reasoning_correct_mask]
+        if valid_reasoning_lengths_correct.numel() > 0:
+            mean_reasoning_length_correct = torch.mean(valid_reasoning_lengths_correct).detach().item()
+        else:
+            mean_reasoning_length_correct = 0.0
+
+        reasoning_incorrect_mask = reasoning_valid_mask & incorrect_mask
+        valid_reasoning_lengths_incorrect = reasoning_token_lengths[reasoning_incorrect_mask]
+        if valid_reasoning_lengths_incorrect.numel() > 0:
+            mean_reasoning_length_incorrect = torch.mean(valid_reasoning_lengths_incorrect).detach().item()
+        else:
+            mean_reasoning_length_incorrect = 0.0
+    else:
+        mean_reasoning_length = 0.0
+        mean_reasoning_length_correct = 0.0
+        mean_reasoning_length_incorrect = 0.0
+
     metrics = {
         # score
         "critic/score/mean": score_mean,
@@ -187,6 +364,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         ),
         # response length
         "response_length/mean": torch.mean(response_length).detach().item(),
+        "response_length/mean_correct": correct_non_aborted_response_length_mean,
+        "response_length/mean_incorrect": incorrect_non_aborted_response_length_mean,
         "response_length/max": torch.max(response_length).detach().item(),
         "response_length/min": torch.min(response_length).detach().item(),
         "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
@@ -198,6 +377,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "response_length_non_aborted/max": non_aborted_response_length_max,
         "response_length_non_aborted/min": non_aborted_response_length_min,
         "response_length_non_aborted/clip_ratio": non_aborted_response_length_clip_ratio,
+        "response_length/mean_reasoning": mean_reasoning_length,
+        "response_length/mean_reasoning_correct": mean_reasoning_length_correct,
+        "response_length/mean_reasoning_incorrect": mean_reasoning_length_incorrect,
+        "response_length/incorrect_non_aborted_mean": incorrect_non_aborted_response_length_mean,
         # aborted ratio
         # Fraction of samples whose response length is zero
         "response/aborted_ratio": aborted_ratio,
@@ -300,6 +483,215 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
         "perf/time_per_step": time,
         "perf/throughput": total_num_tokens / (time * n_gpus),
     }
+
+
+def compute_completion_metrics(batch: DataProto, generation_budget: int) -> dict[str, Any]:
+    """Compute fractions of truncated / finished responses and their correctness.
+
+    Args:
+        batch: DataProto after rollout + reward computation.
+        generation_budget: The effective max number of response tokens allowed
+            during generation (e.g., max_response_length or adaptive window).
+    """
+    response_info = _compute_response_info(batch)
+    response_length = response_info["response_length"]  # (batch_size,)
+
+    # Identify responses that hit (or exceed) the generation budget.
+    truncated_mask = response_length >= generation_budget
+    finished_mask = ~truncated_mask
+
+    batch_size = response_length.shape[0]
+    if batch_size == 0:
+        return {
+            "completion/truncated_frac": 0.0,
+            "completion/finished_frac": 0.0,
+            "completion/truncated_correct_frac": 0.0,
+            "completion/finished_correct_frac": 0.0,
+            "completion/correct_mean_length": 0.0,
+            "completion/success_rate": 0.0,
+        }
+
+    truncated_frac = truncated_mask.float().mean().item()
+    finished_frac = finished_mask.float().mean().item()
+
+    # Sequence-level raw task score (before KL), e.g. 0, 0.1, 1.0 for countdown.
+    if "token_level_scores" in batch.batch:
+        token_level_scores = batch.batch["token_level_scores"]
+        seq_scores = token_level_scores.sum(-1)
+        correct_mask = seq_scores >= 0.99  # treat ~1.0 as strictly correct
+    else:
+        # Fallback: no notion of correctness
+        correct_mask = torch.zeros_like(response_length, dtype=torch.bool)
+
+    truncated_count = truncated_mask.float().sum().item()
+    finished_count = finished_mask.float().sum().item()
+
+    correct_count = correct_mask.float().sum().item()
+    if correct_count > 0:
+        correct_mean_length = response_length[correct_mask].float().mean().item()
+    else:
+        correct_mean_length = 0.0
+
+    if truncated_count > 0:
+        truncated_correct_frac = (truncated_mask & correct_mask).float().sum().item() / truncated_count
+    else:
+        truncated_correct_frac = 0.0
+
+    if finished_count > 0:
+        finished_correct_frac = (finished_mask & correct_mask).float().sum().item() / finished_count
+    else:
+        finished_correct_frac = 0.0
+
+    # Overall success rate (fraction of correct answers)
+    overall_success_rate = correct_count / batch_size if batch_size > 0 else 0.0
+
+    metrics = {
+        "completion/truncated_frac": truncated_frac,
+        "completion/finished_frac": finished_frac,
+        "completion/truncated_correct_frac": truncated_correct_frac,
+        "completion/finished_correct_frac": finished_correct_frac,
+        "completion/correct_mean_length": correct_mean_length,
+        "completion/success_rate": overall_success_rate,
+    }
+
+    # Add UUID-based group metrics if available
+    if "uid" in batch.non_tensor_batch:
+        group_metrics = compute_group_success_metrics(batch, correct_mask)
+        metrics.update(group_metrics)
+
+    return metrics
+
+
+def compute_group_success_metrics(batch: DataProto, correct_mask: torch.Tensor) -> dict[str, Any]:
+    """Compute success metrics for GRPO groups (responses sharing the same prompt).
+
+    Adaptive groups can produce variable group sizes per step (e.g. 2 for easy
+    prompts and 30 for hard ones), so we bucket groups by their *correctness
+    fraction* (constant 4 buckets) rather than by absolute correct count
+    (which used to emit 2 metrics per possible group size, blowing up the
+    completion tab).
+
+    Buckets:
+        all_wrong         frac == 0          (no learning signal)
+        minority_correct  0 < frac < 0.5
+        majority_correct  0.5 <= frac < 1
+        all_correct       frac == 1          (no learning signal in vanilla GRPO)
+    """
+    uids = batch.non_tensor_batch["uid"]
+
+    uid_to_correct = defaultdict(list)
+    response_info = _compute_response_info(batch)
+    response_lengths = response_info["response_length"]
+    uid_to_response_lengths = defaultdict(list)
+
+    for i, uid in enumerate(uids):
+        is_correct = correct_mask[i].item() if torch.is_tensor(correct_mask[i]) else correct_mask[i]
+        uid_to_correct[uid].append(bool(is_correct))
+        uid_to_response_lengths[uid].append(float(response_lengths[i].item()))
+
+    total_groups = len(uid_to_correct)
+    if total_groups == 0:
+        return {}
+
+    bucket_counts = {"all_wrong": 0, "minority_correct": 0, "majority_correct": 0, "all_correct": 0}
+    bucket_lengths: dict[str, list[float]] = {k: [] for k in bucket_counts}
+    correct_fractions: list[float] = []
+    group_sizes: list[int] = []
+
+    for uid, correctness_list in uid_to_correct.items():
+        n = len(correctness_list)
+        if n == 0:
+            continue
+        frac = sum(correctness_list) / n
+        correct_fractions.append(frac)
+        group_sizes.append(n)
+        if frac == 0.0:
+            bucket = "all_wrong"
+        elif frac == 1.0:
+            bucket = "all_correct"
+        elif frac < 0.5:
+            bucket = "minority_correct"
+        else:
+            bucket = "majority_correct"
+        bucket_counts[bucket] += 1
+        group_lengths = uid_to_response_lengths[uid]
+        if group_lengths:
+            bucket_lengths[bucket].append(float(np.mean(group_lengths)))
+
+    metrics: dict[str, Any] = {}
+    for bucket, count in bucket_counts.items():
+        metrics[f"completion/groups/{bucket}_pct"] = 100.0 * count / total_groups
+        lengths = bucket_lengths[bucket]
+        metrics[f"completion/groups/{bucket}_mean_length"] = (
+            float(np.mean(lengths)) if lengths else 0.0
+        )
+
+    metrics["completion/groups/mean_correct_frac"] = float(np.mean(correct_fractions))
+    metrics["completion/groups/mean_size"] = float(np.mean(group_sizes))
+
+    return metrics
+
+
+def compute_difficulty_metrics(batch: DataProto) -> dict[str, Any]:
+    """Compute accuracy broken down by difficulty level (e.g. 3 vs 4).
+
+    We assume that non_tensor_batch['reward_model'][i]['ground_truth'] contains
+    a 'difficulty' field for each sample.
+    """
+    if "token_level_scores" not in batch.batch:
+        return {}
+
+    # Sequence-level raw scores to determine correctness.
+    token_level_scores = batch.batch["token_level_scores"]
+    seq_scores = token_level_scores.sum(-1)
+    correct_mask = seq_scores >= 0.99  # strictly correct
+
+    rm_info = batch.non_tensor_batch.get("reward_model", None)
+    if rm_info is None:
+        return {}
+
+    # Extract per-sample difficulty if available.
+    difficulties = []
+    for i in range(len(seq_scores)):
+        info = rm_info[i]
+        gt = info.get("ground_truth", {})
+        if isinstance(gt, dict):
+            difficulties.append(gt.get("difficulty", None))
+        else:
+            difficulties.append(None)
+
+    # Compute counts and accuracies for difficulty 3 and 4.
+    diff3_total = 0
+    diff3_correct = 0
+    diff4_total = 0
+    diff4_correct = 0
+
+    for i, d in enumerate(difficulties):
+        if d == 3:
+            diff3_total += 1
+            if correct_mask[i]:
+                diff3_correct += 1
+        elif d == 4:
+            diff4_total += 1
+            if correct_mask[i]:
+                diff4_correct += 1
+
+    metrics = {}
+    if diff3_total > 0:
+        metrics["difficulty/3_acc"] = diff3_correct / diff3_total
+        metrics["difficulty/3_count"] = float(diff3_total)
+    else:
+        metrics["difficulty/3_acc"] = 0.0
+        metrics["difficulty/3_count"] = 0.0
+
+    if diff4_total > 0:
+        metrics["difficulty/4_acc"] = diff4_correct / diff4_total
+        metrics["difficulty/4_count"] = float(diff4_total)
+    else:
+        metrics["difficulty/4_acc"] = 0.0
+        metrics["difficulty/4_count"] = 0.0
+
+    return metrics
 
 
 def bootstrap_metric(
@@ -452,6 +844,8 @@ def process_validation_metrics(
                         ns.append(n)
                         n *= 2
                     ns.append(n_resps)
+
+                    metric[f"all_correct@{n_resps}"] = float(np.min(var_vals) >= 1.0)
 
                     for n in ns:
                         [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(

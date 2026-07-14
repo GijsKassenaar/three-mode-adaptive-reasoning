@@ -18,6 +18,9 @@ import warnings
 
 __all__ = ["hf_tokenizer", "hf_processor"]
 
+# Default switch: keep processor creation off unless you flip this to True.
+ENABLE_PROCESSOR = False
+
 
 def set_pad_token_id(tokenizer):
     """Set pad_token_id to eos_token_id if it is None.
@@ -73,6 +76,9 @@ def hf_processor(name_or_path, **kwargs):
     Returns:
         transformers.ProcessorMixin: The pretrained processor.
     """
+    if not ENABLE_PROCESSOR:
+        return None
+
     from transformers import AutoConfig, AutoProcessor
 
     try:

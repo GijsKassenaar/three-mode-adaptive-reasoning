@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -37,17 +38,28 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import DataProtoConfig, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    compute_completion_metrics,
     compute_data_metrics,
+    compute_difficulty_metrics,
+    compute_reasoning_token_statistics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+)
+from verl.trainer.ppo.three_mode_routing import (
+    ThreeModeRoutingConfig,
+    ThreeModeRoutingForcer,
+    apply_three_mode_caps,
+    compute_three_mode_routing_metrics,
+    effective_balance_coef,
+    enabled_modes_from_config,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -191,6 +203,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    tokenizer: Any = None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -206,6 +219,8 @@ def compute_advantage(
         norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in
             GRPO. Defaults to True.
         config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
+        tokenizer: Optional tokenizer, required by three_mode_routing.reasoning_only (the gamma^L
+            discount over reasoning tokens needs to decode/re-tokenize responses).
 
     Returns:
         DataProto: The updated data with computed advantages and returns.
@@ -257,11 +272,67 @@ def compute_advantage(
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
 
+        if adv_estimator == AdvantageEstimator.THREE_MODE_ROUTING:
+            if "routing_mode" not in data.non_tensor_batch:
+                raise ValueError(
+                    "routing_mode is required in non_tensor_batch for three_mode_routing estimator. "
+                    "Enable algorithm.three_mode_routing.enable=True to activate rollout building."
+                )
+            adv_kwargs["routing_mode"] = data.non_tensor_batch["routing_mode"]
+            if "routing_token_length" in data.non_tensor_batch:
+                adv_kwargs["routing_token_length"] = data.non_tensor_batch["routing_token_length"]
+            if "routing_forced" in data.non_tensor_batch:
+                # Lets the balance term restrict itself to free rollouts (balance_free_only).
+                adv_kwargs["routing_forced"] = data.non_tensor_batch["routing_forced"]
+            adv_kwargs["global_step"] = int((data.meta_info or {}).get("global_steps", 0))
+
+            tmr_cfg_rt = config.get("three_mode_routing") if config is not None else None
+            if tmr_cfg_rt is not None and bool(tmr_cfg_rt.get("reasoning_only", False)):
+                if tokenizer is None:
+                    raise ValueError(
+                        "Tokenizer is required when algorithm.three_mode_routing.reasoning_only=True"
+                    )
+                _, reasoning_lengths_tmr, _, _ = compute_reasoning_token_statistics(data, tokenizer)
+                adv_kwargs["reasoning_lengths"] = reasoning_lengths_tmr
+
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     return data
+
+
+def _concat_dataprotos_non_empty(chunks: list[DataProto]) -> DataProto:
+    """Concatenate only non-empty DataProto chunks, aligning schemas across chunks first."""
+    non_empty = [chunk for chunk in chunks if len(chunk) > 0]
+    if not non_empty:
+        return chunks[0][:0]
+    if len(non_empty) == 1:
+        return non_empty[0]
+
+    # DataProto.concat requires identical tensor and non-tensor key schemas.
+    # Hybrid branches can differ in optional keys (e.g., rm_scores/response_mask),
+    # so we align by intersecting keys present in every chunk.
+    common_batch_keys = None
+    common_non_tensor_keys = None
+    for chunk in non_empty:
+        batch_keys = set(chunk.batch.keys()) if chunk.batch is not None else set()
+        non_tensor_keys = set(chunk.non_tensor_batch.keys())
+        if common_batch_keys is None:
+            common_batch_keys = batch_keys
+            common_non_tensor_keys = non_tensor_keys
+        else:
+            common_batch_keys &= batch_keys
+            common_non_tensor_keys &= non_tensor_keys
+
+    aligned = [
+        chunk.select(
+            batch_keys=sorted(common_batch_keys) if common_batch_keys else [],
+            non_tensor_batch_keys=sorted(common_non_tensor_keys) if common_non_tensor_keys else [],
+        )
+        for chunk in non_empty
+    ]
+    return DataProto.concat(aligned)
 
 
 class RayPPOTrainer:
@@ -351,6 +422,22 @@ class RayPPOTrainer:
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
+        # Three-mode self-routing forcer (NOTHINK / SHORT / LONG).
+        self._three_mode_routing_forcer: Optional[ThreeModeRoutingForcer] = None
+        tmr_cfg_init = OmegaConf.select(self.config, "algorithm.three_mode_routing")
+        if tmr_cfg_init is not None and tmr_cfg_init.get("enable", False):
+            data_chat_kwargs_tmr = OmegaConf.select(self.config, "data.apply_chat_template_kwargs")
+            if data_chat_kwargs_tmr is not None:
+                data_chat_kwargs_tmr = OmegaConf.to_container(data_chat_kwargs_tmr, resolve=True)
+            self._three_mode_routing_forcer = ThreeModeRoutingForcer(
+                config=ThreeModeRoutingConfig(**{
+                    k: v for k, v in OmegaConf.to_container(tmr_cfg_init, resolve=True).items()
+                    if k in ThreeModeRoutingConfig.__dataclass_fields__
+                }),
+                tokenizer=tokenizer,
+                apply_chat_template_kwargs=data_chat_kwargs_tmr,
+            )
+
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -437,6 +524,81 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
+    def _is_three_mode_active(self) -> bool:
+        """True when three_mode_routing is enabled (always routes through forcer)."""
+        return self._three_mode_routing_forcer is not None
+
+    def _is_three_mode_warmup(self) -> bool:
+        """True during phase 1 (heavy forcing: n//4 per mode)."""
+        if not self._is_three_mode_active():
+            return False
+        return self.global_steps <= self._three_mode_routing_forcer.config.warmup_steps
+
+    def _is_three_mode_warmup2(self) -> bool:
+        """True during phase 2 (light forcing: 1 per mode).
+
+        Active when warmup2_steps > warmup_steps and we are past phase 1.
+        """
+        if not self._is_three_mode_active():
+            return False
+        cfg = self._three_mode_routing_forcer.config
+        warmup2 = int(cfg.warmup2_steps)
+        return warmup2 > int(cfg.warmup_steps) and self.global_steps <= warmup2
+
+    def _build_three_mode_rollouts(
+        self,
+        gen_batch,
+        generate_fn,
+        dp_size=None,
+    ):
+        """Delegate to ThreeModeRoutingForcer with the correct forced/free split.
+
+        Phase 1 (steps 0..warmup_steps):       n//4 forced per mode, remainder free.
+        Phase 2 (warmup_steps..warmup2_steps):  1 forced per mode, remainder free.
+        Phase 3 (post-warmup2):                all n rollouts free.
+
+        n_modes = number of enabled modes (3 by default, 2 for e.g. "nothink,long"),
+        so the forced total is n_forced * n_modes and the free count fills the rest.
+        """
+        if self._three_mode_routing_forcer is None:
+            raise RuntimeError("ThreeModeRoutingForcer is not initialized")
+        cfg = self._three_mode_routing_forcer.config
+        n_rollouts = cfg.n_rollouts
+
+        # train_forced_mode (ablation): every rollout, every step, forced into one mode —
+        # bypasses the phased warmup/free split entirely. Only this mode is ever forced,
+        # regardless of enabled_modes.
+        train_forced_mode = str(getattr(cfg, "train_forced_mode", "") or "").lower().strip()
+        if train_forced_mode in ("nothink", "short", "long"):
+            return self._three_mode_routing_forcer.build_rollouts(
+                gen_batch=gen_batch,
+                generate_fn=generate_fn,
+                n_forced=n_rollouts,
+                n_free=0,
+                max_prompt_length=int(self.config.data.max_prompt_length),
+                dp_size=dp_size,
+                forced_modes=[train_forced_mode],
+            )
+
+        n_modes = len(enabled_modes_from_config(cfg))
+        if self._is_three_mode_warmup():
+            n_forced = max(1, n_rollouts // 4)  # phase 1: n=4→1, n=8→2
+            n_free = max(0, n_rollouts - n_modes * n_forced)
+        elif self._is_three_mode_warmup2():
+            n_forced = 1  # phase 2: 1 per enabled mode
+            n_free = max(0, n_rollouts - n_modes)
+        else:
+            n_forced = 0
+            n_free = n_rollouts
+        return self._three_mode_routing_forcer.build_rollouts(
+            gen_batch=gen_batch,
+            generate_fn=generate_fn,
+            n_forced=n_forced,
+            n_free=n_free,
+            max_prompt_length=int(self.config.data.max_prompt_length),
+            dp_size=dp_size,
+        )
+
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
@@ -496,6 +658,45 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    def _print_val_samples(self, inputs, outputs, gts, scores, routing_modes=None, n: int = 5):
+        """Print N validation samples to stdout so they show up in the SLURM log.
+
+        Uses a step-offset seed so each validation surfaces a different subset
+        but the choice is reproducible.  Truncates very long prompts/outputs
+        so the log stays readable; the full text is still in the W&B table /
+        validation_data_dir dump if those are enabled.
+        """
+        if not inputs:
+            return
+
+        import numpy as np
+
+        n = min(n, len(inputs))
+        rng = np.random.RandomState(42 + int(self.global_steps))
+        indices = list(range(len(inputs)))
+        rng.shuffle(indices)
+        indices = indices[:n]
+
+        bar = "=" * 80
+        print(f"\n{bar}\n[Validation samples — step {self.global_steps}, showing {n} of {len(inputs)}]\n{bar}")
+        for rank, i in enumerate(indices):
+            print(f"\n--- sample {rank + 1} / {n} (idx {i}) ---")
+            if routing_modes is not None and i < len(routing_modes):
+                print(f"routing_mode: {routing_modes[i]}")
+            print(f"score: {float(scores[i]):.3f}")
+            if i < len(gts) and gts[i] is not None:
+                print(f"ground_truth: {gts[i]}")
+
+            inp = str(inputs[i])
+            out = str(outputs[i])
+            if len(inp) > 1200:
+                inp = inp[:600] + "\n...[truncated]...\n" + inp[-600:]
+            if len(out) > 2000:
+                out = out[:1000] + "\n...[truncated]...\n" + out[-1000:]
+            print(f"input:\n{inp}")
+            print(f"output:\n{out}")
+        print(f"{bar}\n", flush=True)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -608,6 +809,26 @@ class RayPPOTrainer:
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
+        correctness_threshold = 0.5
+
+        # Three-mode routing: inject routing question at validation time (no forced token),
+        # then detect NOTHINK/SHORT/LONG from response prefix.
+        three_mode_routing_val_enabled = (
+            self._three_mode_routing_forcer is not None
+            and self.config.algorithm.adv_estimator == AdvantageEstimator.THREE_MODE_ROUTING
+        )
+        if three_mode_routing_val_enabled:
+            tmr_val_cfg = self._three_mode_routing_forcer.config
+            tmr_val_forced_mode = str(getattr(tmr_val_cfg, "val_forced_mode", "") or "").lower().strip()
+            # Prefix match without \b: the next token can attach a word character with
+            # no space, causing \b to miss valid routing words.
+            tmr_nt_re = re.compile(rf"^\s*{re.escape(tmr_val_cfg.nothink_token)}", flags=re.IGNORECASE)
+            tmr_sh_re = re.compile(rf"^\s*{re.escape(tmr_val_cfg.short_token)}", flags=re.IGNORECASE)
+            tmr_lg_re = re.compile(rf"^\s*{re.escape(tmr_val_cfg.long_token)}", flags=re.IGNORECASE)
+        else:
+            tmr_val_forced_mode = ""
+            tmr_nt_re = tmr_sh_re = tmr_lg_re = None
+
         # Lists to collect samples for the table
         sample_inputs = []
         sample_outputs = []
@@ -615,8 +836,14 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_response_lengths = []
+        sample_reasoning_lengths = []
+        sample_is_correct = []
+        sample_routing_modes = []
+        sample_truncated_by_length = []
+        sample_levels = []  # MATH difficulty "Level 1".."Level 5" (when present in the data)
 
-        for test_data in self.val_dataloader:
+        for val_batch_idx, test_data in enumerate(self.val_dataloader):
             test_batch = DataProto.from_single_dict(test_data)
 
             if "uid" not in test_batch.non_tensor_batch:
@@ -638,8 +865,30 @@ class RayPPOTrainer:
             ]
             sample_gts.extend(ground_truths)
 
+            # Capture MATH difficulty level BEFORE _get_gen_batch (which pops non-reward
+            # keys out of test_batch). Aligned with sample_gts → aligned with sample_is_correct.
+            if "level" in test_batch.non_tensor_batch:
+                sample_levels.extend(list(test_batch.non_tensor_batch["level"]))
+
             test_gen_batch = self._get_gen_batch(test_batch)
-            test_gen_batch.meta_info = {
+
+            # Three-mode routing: inject routing question.  In forced-mode eval the routing
+            # token is also appended so the model generates purely in that mode.
+            # prefilled_prompt_mode is re-set after the base_meta_info overwrite below.
+            if three_mode_routing_val_enabled and test_gen_batch.non_tensor_batch.get("raw_prompt") is not None:
+                if tmr_val_forced_mode in ("nothink", "short", "long"):
+                    test_gen_batch = self._three_mode_routing_forcer._ctrl.augment_batch(
+                        gen_batch=test_gen_batch,
+                        routing_mode=tmr_val_forced_mode,
+                        max_prompt_length=int(self.config.data.max_prompt_length),
+                    )
+                else:
+                    test_gen_batch = self._three_mode_routing_forcer.append_routing_question(
+                        gen_batch=test_gen_batch,
+                        max_prompt_length=int(self.config.data.max_prompt_length),
+                    )
+
+            base_meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
@@ -647,6 +896,10 @@ class RayPPOTrainer:
                 "validate": True,
                 "global_steps": self.global_steps,
             }
+            test_gen_batch.meta_info = dict(base_meta_info)
+            if three_mode_routing_val_enabled and test_gen_batch.non_tensor_batch.get("raw_prompt") is not None:
+                # Same: routing question was injected above; re-set flag after meta_info overwrite
+                test_gen_batch.meta_info["prefilled_prompt_mode"] = True
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
@@ -655,14 +908,16 @@ class RayPPOTrainer:
                 if not self.async_rollout_mode
                 else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            def _gen(batch):
+                padded, pad = pad_dataproto_to_divisor(batch, size_divisor)
+                if not self.async_rollout_mode:
+                    out_padded = self.actor_rollout_wg.generate_sequences(padded)
+                else:
+                    out_padded = self.async_rollout_manager.generate_sequences(padded)
+                return unpad_dataproto(out_padded, pad_size=pad)
+
+            test_output_gen_batch = _gen(test_gen_batch)
 
             print("validation generation end")
 
@@ -671,8 +926,64 @@ class RayPPOTrainer:
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
+            if three_mode_routing_val_enabled and tmr_nt_re is not None:
+                for text in output_texts:
+                    if tmr_val_forced_mode in ("nothink", "short", "long"):
+                        # Routing token was injected into prompt; response starts after it.
+                        # Mode is known — no regex needed.
+                        mode = tmr_val_forced_mode
+                    elif tmr_nt_re.match(text):
+                        mode = "nothink"
+                    elif tmr_sh_re.match(text):
+                        mode = "short"
+                    elif tmr_lg_re.match(text):
+                        mode = "long"
+                    else:
+                        mode = "unknown"
+                    sample_routing_modes.append(mode)
+
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+
+            # Three-mode routing: optionally apply the per-mode token caps before
+            # scoring so validation reflects the trained (capped) objective — a
+            # diagnostic mode.  Default off: validation measures production
+            # behaviour (free generation, no truncation harness), at the cost of a
+            # small train/val mismatch for over-cap NOTHINK/SHORT responses.
+            # Enable via algorithm.three_mode_routing.apply_caps_in_validation=True.
+            # Note: the sample texts logged above remain untruncated (cosmetic only);
+            # the reward manager reads lengths from the attention mask we mutate here.
+            if (
+                three_mode_routing_val_enabled
+                and bool(getattr(tmr_val_cfg, "apply_caps_in_validation", False))
+                and any(
+                    x is not None
+                    for x in (
+                        tmr_val_cfg.nothink_max_tokens,
+                        tmr_val_cfg.short_max_tokens,
+                        tmr_val_cfg.long_max_tokens,
+                    )
+                )
+            ):
+                if tmr_val_forced_mode in ("nothink", "short", "long"):
+                    # Forced-mode eval: the routing token sits in the prompt, so the
+                    # response carries no routing word to detect — trust the forced mode
+                    # and grant no routing-token cap allowance (zeros).
+                    val_known_modes = np.full(len(test_batch), tmr_val_forced_mode, dtype=object)
+                    val_known_forced = np.ones(len(test_batch), dtype=bool)
+                    val_rt_lengths = np.zeros(len(test_batch), dtype=np.int64)
+                else:
+                    val_known_modes = None
+                    val_known_forced = None
+                    val_rt_lengths = None
+                apply_three_mode_caps(
+                    test_batch,
+                    tokenizer=self.tokenizer,
+                    config=tmr_val_cfg,
+                    known_modes=val_known_modes,
+                    known_forced=val_known_forced,
+                    routing_token_lengths=val_rt_lengths,
+                )
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
@@ -687,8 +998,45 @@ class RayPPOTrainer:
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
+            _, reasoning_lengths_tensor, closed_think_tensor, valid_response_lengths = compute_reasoning_token_statistics(
+                batch=test_batch,
+                tokenizer=self.tokenizer,
+            )
+            response_len_max = int(test_batch.batch["responses"].shape[-1])
+            truncated_no_close_mask = (valid_response_lengths >= response_len_max) & (~closed_think_tensor)
+            if truncated_no_close_mask.any():
+                reasoning_lengths_tensor = reasoning_lengths_tensor.clone()
+                reasoning_lengths_tensor[truncated_no_close_mask] = valid_response_lengths[
+                    truncated_no_close_mask
+                ].to(dtype=reasoning_lengths_tensor.dtype)
+
+            # Aborted-by-length: response filled the entire response tensor.  vLLM stops
+            # at max_tokens without an EOS in these cases, so the generation was cut off.
+            truncated_by_length_mask = valid_response_lengths >= response_len_max
+            sample_truncated_by_length.extend(truncated_by_length_mask.float().cpu().tolist())
+
+            sample_response_lengths.extend(valid_response_lengths.float().cpu().tolist())
+            sample_reasoning_lengths.extend(reasoning_lengths_tensor.float().cpu().tolist())
+
             reward_extra_infos_dict["reward"].extend(scores)
             reward_extra_info = result.get("reward_extra_info", {})
+
+            batch_acc_values = reward_extra_info.get("acc", None)
+            if batch_acc_values is None:
+                batch_is_correct = [1.0 if score > correctness_threshold else 0.0 for score in scores]
+            elif isinstance(batch_acc_values, np.ndarray):
+                batch_is_correct = np.asarray(batch_acc_values, dtype=np.float32).reshape(-1).tolist()
+            elif torch.is_tensor(batch_acc_values):
+                batch_is_correct = batch_acc_values.detach().float().cpu().reshape(-1).tolist()
+            elif isinstance(batch_acc_values, list):
+                batch_is_correct = [float(v) for v in batch_acc_values]
+            else:
+                batch_is_correct = [float(batch_acc_values)]
+
+            if len(batch_is_correct) != len(scores):
+                batch_is_correct = [1.0 if score > correctness_threshold else 0.0 for score in scores]
+            sample_is_correct.extend(batch_is_correct)
+
             for key, values in reward_extra_info.items():
                 if key not in reward_extra_infos_dict:
                     reward_extra_infos_dict[key] = []
@@ -704,6 +1052,16 @@ class RayPPOTrainer:
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        # Print N validation samples to stdout (captured in the SLURM .log via tee).
+        self._print_val_samples(
+            inputs=sample_inputs,
+            outputs=sample_outputs,
+            gts=sample_gts,
+            scores=sample_scores,
+            routing_modes=sample_routing_modes if three_mode_routing_val_enabled else None,
+            n=5,
+        )
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -731,7 +1089,7 @@ class RayPPOTrainer:
                 for metric_name, metric_val in metric2val.items():
                     if (
                         (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best", "all_correct"])
                         and (f"@{n_max}" in metric_name)
                     ):
                         metric_sec = "val-core"
@@ -745,6 +1103,143 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        if len(sample_response_lengths) > 0 and len(sample_reasoning_lengths) > 0 and len(sample_is_correct) > 0:
+            n = min(len(sample_response_lengths), len(sample_reasoning_lengths), len(sample_is_correct))
+            response_lengths_arr = np.asarray(sample_response_lengths[:n], dtype=np.float32)
+            reasoning_lengths_arr = np.asarray(sample_reasoning_lengths[:n], dtype=np.float32)
+            correct_mask = np.asarray(sample_is_correct[:n], dtype=np.float32) > 0.5
+
+            def _length_stats(arr: np.ndarray, prefix: str) -> None:
+                """Emit mean/std/percentile metrics for a length array into val-lengths/ tab."""
+                if len(arr) == 0:
+                    for sfx in ("mean", "std", "p25", "p50", "p75", "p90"):
+                        metric_dict[f"val-lengths/{prefix}/{sfx}"] = 0.0
+                    return
+                metric_dict[f"val-lengths/{prefix}/mean"] = float(arr.mean())
+                metric_dict[f"val-lengths/{prefix}/std"] = float(arr.std())
+                p25, p50, p75, p90 = np.percentile(arr, [25, 50, 75, 90])
+                metric_dict[f"val-lengths/{prefix}/p25"] = float(p25)
+                metric_dict[f"val-lengths/{prefix}/p50"] = float(p50)
+                metric_dict[f"val-lengths/{prefix}/p75"] = float(p75)
+                metric_dict[f"val-lengths/{prefix}/p90"] = float(p90)
+
+            _length_stats(response_lengths_arr, "response")
+            _length_stats(reasoning_lengths_arr, "reasoning")
+            # Keep legacy val-aux means for backwards-compat with existing W&B charts
+            metric_dict["val-aux/response_length/mean"] = metric_dict["val-lengths/response/mean"]
+            metric_dict["val-aux/reasoning_length/mean"] = metric_dict["val-lengths/reasoning/mean"]
+
+            if np.any(correct_mask):
+                _length_stats(response_lengths_arr[correct_mask], "response_correct")
+                _length_stats(reasoning_lengths_arr[correct_mask], "reasoning_correct")
+            else:
+                for sfx in ("mean", "std", "p25", "p50", "p75", "p90"):
+                    metric_dict[f"val-lengths/response_correct/{sfx}"] = 0.0
+                    metric_dict[f"val-lengths/reasoning_correct/{sfx}"] = 0.0
+            metric_dict["val-aux/response_length/mean_correct"] = metric_dict.get("val-lengths/response_correct/mean", 0.0)
+            metric_dict["val-aux/reasoning_length/mean_correct"] = metric_dict.get("val-lengths/reasoning_correct/mean", 0.0)
+
+            incorrect_mask = ~correct_mask
+            if np.any(incorrect_mask):
+                _length_stats(response_lengths_arr[incorrect_mask], "response_incorrect")
+                _length_stats(reasoning_lengths_arr[incorrect_mask], "reasoning_incorrect")
+            else:
+                for sfx in ("mean", "std", "p25", "p50", "p75", "p90"):
+                    metric_dict[f"val-lengths/response_incorrect/{sfx}"] = 0.0
+                    metric_dict[f"val-lengths/reasoning_incorrect/{sfx}"] = 0.0
+            metric_dict["val-aux/response_length/mean_incorrect"] = metric_dict.get("val-lengths/response_incorrect/mean", 0.0)
+            metric_dict["val-aux/reasoning_length/mean_incorrect"] = metric_dict.get("val-lengths/reasoning_incorrect/mean", 0.0)
+
+            metric_dict["val-lengths/correct_fraction"] = float(correct_mask.mean())
+
+            # Log length histograms directly to W&B (not via metric_dict to avoid breaking
+            # non-wandb loggers that can't serialise Histogram objects).
+            try:
+                import wandb as _wandb
+                if _wandb.run is not None:
+                    hist_data: dict[str, object] = {
+                        "val-lengths/response_hist": _wandb.Histogram(response_lengths_arr),
+                        "val-lengths/reasoning_hist": _wandb.Histogram(reasoning_lengths_arr),
+                    }
+                    if np.any(correct_mask):
+                        hist_data["val-lengths/response_correct_hist"] = _wandb.Histogram(
+                            response_lengths_arr[correct_mask]
+                        )
+                        hist_data["val-lengths/reasoning_correct_hist"] = _wandb.Histogram(
+                            reasoning_lengths_arr[correct_mask]
+                        )
+                    if np.any(incorrect_mask):
+                        hist_data["val-lengths/response_incorrect_hist"] = _wandb.Histogram(
+                            response_lengths_arr[incorrect_mask]
+                        )
+                        hist_data["val-lengths/reasoning_incorrect_hist"] = _wandb.Histogram(
+                            reasoning_lengths_arr[incorrect_mask]
+                        )
+                    _wandb.log(hist_data, step=self.global_steps, commit=False)
+            except Exception:
+                pass
+
+            # Aborted-by-length metrics: how often did the response hit the max_tokens cap?
+            if len(sample_truncated_by_length) >= n:
+                truncated_arr = np.asarray(sample_truncated_by_length[:n], dtype=np.float32) > 0.5
+                metric_dict["val-aux/truncated_by_length/fraction"] = float(truncated_arr.mean())
+                if np.any(correct_mask):
+                    metric_dict["val-aux/truncated_by_length/correct_fraction"] = float(
+                        truncated_arr[correct_mask].mean()
+                    )
+                # Per-routing-mode truncation fraction (useful for spotting which mode hits its cap)
+                if three_mode_routing_val_enabled and len(sample_routing_modes) >= n:
+                    modes_arr = np.asarray(
+                        [str(m).lower() for m in sample_routing_modes[:n]], dtype=object
+                    )
+                    for mode in ("nothink", "short", "long"):
+                        mode_mask = modes_arr == mode
+                        if mode_mask.any():
+                            metric_dict[f"val-aux/truncated_by_length/{mode}_fraction"] = float(
+                                truncated_arr[mode_mask].mean()
+                            )
+
+        if three_mode_routing_val_enabled and len(sample_routing_modes) > 0 and len(sample_is_correct) > 0:
+            n = min(len(sample_routing_modes), len(sample_is_correct), len(sample_response_lengths), len(sample_uids))
+            tmr_val_metrics = compute_three_mode_routing_metrics(
+                routing_mode=np.asarray(sample_routing_modes[:n], dtype=object),
+                is_correct=torch.as_tensor(sample_is_correct[:n], dtype=torch.float32),
+                response_lengths=torch.as_tensor(sample_response_lengths[:n], dtype=torch.float32),
+                index=np.asarray(sample_uids[:n], dtype=object),
+                advantages=None,  # not available at validation time
+            )
+            for key, val in tmr_val_metrics.items():
+                metric_dict[key.replace("three_mode_routing/", "val-aux/three_mode_routing/")] = val
+
+        # ── Per-difficulty validation metrics (val-difficulties/) ────────────────
+        # MATH `level` ("Level 1".."Level 5"): accuracy and (when routing is active)
+        # the routing-mode split per difficulty bucket. Only emitted when the data
+        # carries a level field; for non-routing runs the mode split is skipped.
+        if len(sample_levels) > 0 and len(sample_is_correct) > 0:
+            n = min(len(sample_levels), len(sample_is_correct))
+            lv_correct = np.asarray(sample_is_correct[:n], dtype=np.float32)
+
+            def _lvl(x):
+                digits = "".join(ch for ch in str(x) if ch.isdigit())
+                return digits if digits else "unknown"
+
+            lv_keys = np.array([_lvl(x) for x in sample_levels[:n]], dtype=object)
+            have_modes = len(sample_routing_modes) >= n
+            if have_modes:
+                lv_modes = np.array([str(m).lower() for m in sample_routing_modes[:n]], dtype=object)
+            for lv in sorted(set(lv_keys)):
+                mask = lv_keys == lv
+                cnt = int(mask.sum())
+                if cnt == 0:
+                    continue
+                metric_dict[f"val-difficulties/level{lv}/count"] = float(cnt)
+                metric_dict[f"val-difficulties/level{lv}/acc"] = float(lv_correct[mask].mean())
+                if have_modes:
+                    for mode in ("nothink", "short", "long", "unknown"):
+                        metric_dict[f"val-difficulties/level{lv}/{mode}_frac"] = float(
+                            (lv_modes[mask] == mode).mean()
+                        )
 
         return metric_dict
 
@@ -1208,6 +1703,7 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        rollout_repeat_times = int(batch.meta_info.get("rollout_repeat_times", self.config.actor_rollout_ref.rollout.n))
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1215,7 +1711,7 @@ class RayPPOTrainer:
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+            ppo_mini_batch_size = ppo_mini_batch_size * rollout_repeat_times
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
             seed = self.config.actor_rollout_ref.actor.data_loader_seed
             shuffle = self.config.actor_rollout_ref.actor.shuffle
@@ -1240,12 +1736,13 @@ class RayPPOTrainer:
         return actor_output
 
     def _update_critic(self, batch: DataProto) -> DataProto:
+        rollout_repeat_times = int(batch.meta_info.get("rollout_repeat_times", self.config.actor_rollout_ref.rollout.n))
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
             ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
-            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+            ppo_mini_batch_size = ppo_mini_batch_size * rollout_repeat_times
             ppo_epochs = self.config.critic.ppo_epochs
             seed = self.config.critic.data_loader_seed
             shuffle = self.config.critic.shuffle
@@ -1286,369 +1783,492 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        run_succeeded = False
 
         self.global_steps = 0
+        progress_bar = None
 
-        # load checkpoint before doing anything
-        self._load_checkpoint()
+        try:
+            # load checkpoint before doing anything
+            self._load_checkpoint()
 
-        current_epoch = self.global_steps // len(self.train_dataloader)
+            current_epoch = self.global_steps // len(self.train_dataloader)
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
-
-        if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
-            rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
-            rollout_skip.wrap_generate_sequences()
-
-        # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
-
-        # we start from step 1
-        self.global_steps += 1
-        last_val_metrics = None
-        self.max_steps_duration = 0
-
-        prev_step_profile = False
-        curr_step_profile = (
-            self.global_steps in self.config.global_profiler.steps
-            if self.config.global_profiler.steps is not None
-            else False
-        )
-        next_step_profile = False
-
-        for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
-                if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
-                    self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
-                metrics = {}
-                timing_raw = {}
-
-                with marked_timer("start_profile", timing_raw):
-                    self._start_profiling(
-                        not prev_step_profile and curr_step_profile
-                        if self.config.global_profiler.profile_continuous_steps
-                        else curr_step_profile
-                    )
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
-
-                gen_batch = self._get_gen_batch(batch)
-
-                # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
-
-                is_last_step = self.global_steps >= self.total_training_steps
-                with marked_timer("step", timing_raw):
-                    # generate a batch
-                    with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                        else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
-
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        if self.reward_fn is None:
-                            raise ValueError("A reward_fn is required for REMAX advantage estimation.")
-
-                        with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                            else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            batch = batch.union(gen_baseline_output)
-                            # compute reward model score on batch
-                            rm_scores = None
-                            if self.use_rm and "rm_scores" not in batch.batch.keys():
-                                if not self.use_reward_loop:
-                                    rm_scores = self.rm_wg.compute_rm_score(batch)
-                                else:
-                                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                    rm_scores = self.reward_loop_manager.compute_rm_score(batch)
-                                batch = batch.union(rm_scores)
-
-                            # Compute or extract reward for REMAX baseline
-                            reward_baseline_tensor = self._compute_or_extract_reward(
-                                batch, reward_fn=self.reward_fn, sum_reward=True
-                            )
-
-                            keys_to_pop = set(gen_baseline_output.batch.keys())
-                            if rm_scores is not None:
-                                keys_to_pop.update(rm_scores.batch.keys())
-                            batch.pop(batch_keys=list(keys_to_pop))
-
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                            del rm_scores, gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
-
-                    if "response_mask" not in batch.batch.keys():
-                        batch.batch["response_mask"] = compute_response_mask(batch)
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
-
-                    # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            if not self.use_reward_loop:
-                                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            else:
-                                assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        # Compute or extract reward for training
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
-                            )
-                        else:
-                            reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
-                                batch, reward_fn=self.reward_fn, return_dict=False
-                            )
-
-                    # Operating Mode Selection:
-                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
-                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
-
-                        apply_bypass_mode(
-                            batch=batch,
-                            rollout_corr_config=rollout_corr_config,
-                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
-                        )
-                    else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            actor_config = self.config.actor_rollout_ref.actor
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys,
-                                loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
-                                loss_scale_factor=actor_config.loss_scale_factor,
-                            )
-                            old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
-                                "perf/mfu/actor_infer": old_log_prob_mfu,
-                            }
-                            metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
-                            batch = batch.union(old_log_prob)
-                            if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
-                                from verl.utils.debug.metrics import calculate_debug_metrics
-
-                                metrics.update(calculate_debug_metrics(batch))
-
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
-
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            ref_log_prob = self._compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
-
-                    # compute values
-                    if self.use_critic:
-                        with marked_timer("values", timing_raw, color="cyan"):
-                            values = self._compute_values(batch)
-                            batch = batch.union(values)
-
-                    with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                            )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
-                        if (
-                            rollout_corr_config is not None
-                            and "rollout_log_probs" in batch.batch
-                            and not bypass_recomputing_logprobs  # Only in decoupled mode
-                        ):
-                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-
-                            # Compute IS weights, apply rejection sampling, compute metrics
-                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
-                            # IS and off-policy metrics already have rollout_corr/ prefix
-                            metrics.update(is_metrics)
-
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-
-                    # update critic
-                    if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self._update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
-
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self._update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
-
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-
-                # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                ):
-                    with marked_timer("testing", timing_raw, color="green"):
-                        val_metrics: dict = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
-                    metrics.update(val_metrics)
-
-                # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
-                esi_close_to_expiration = should_save_ckpt_esi(
-                    max_steps_duration=self.max_steps_duration,
-                    redundant_time=self.config.trainer.esi_redundant_time,
-                )
-                # Check if the conditions for saving a checkpoint are met.
-                # The conditions include a mandatory condition (1) and
-                # one of the following optional conditions (2/3/4):
-                # 1. The save frequency is set to a positive value.
-                # 2. It's the last training step.
-                # 3. The current step number is a multiple of the save frequency.
-                # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
-                ):
-                    if esi_close_to_expiration:
-                        print("Force saving checkpoint: ESI instance expiration approaching.")
-                    with marked_timer("save_checkpoint", timing_raw, color="green"):
-                        self._save_checkpoint()
-
-                with marked_timer("stop_profile", timing_raw):
-                    next_step_profile = (
-                        self.global_steps + 1 in self.config.global_profiler.steps
-                        if self.config.global_profiler.steps is not None
-                        else False
-                    )
-                    self._stop_profiling(
-                        curr_step_profile and not next_step_profile
-                        if self.config.global_profiler.profile_continuous_steps
-                        else curr_step_profile
-                    )
-                    prev_step_profile = curr_step_profile
-                    curr_step_profile = next_step_profile
-
-                steps_duration = timing_raw["step"]
-                self.max_steps_duration = max(self.max_steps_duration, steps_duration)
-
-                # training metrics
-                metrics.update(
-                    {
-                        "training/global_step": self.global_steps,
-                        "training/epoch": epoch,
-                    }
-                )
-                # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
-                n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-                # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
-
-                # this is experimental and may be changed/removed in the future in favor of a general-purpose one
-                if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
-                    self.train_dataloader.sampler.update(batch=batch)
-
-                # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
-
-                progress_bar.update(1)
-                self.global_steps += 1
-
-                if (
-                    hasattr(self.config.actor_rollout_ref.actor, "profiler")
-                    and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
-                ):
-                    self.actor_rollout_wg.dump_memory_snapshot(
-                        tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
-                    )
-
-                if is_last_step:
-                    if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
-                        self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
-                    pprint(f"Final validation metrics: {last_val_metrics}")
-                    progress_bar.close()
+            # perform validation before training
+            # currently, we only support validation using the reward_function.
+            if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+                val_metrics = self._validate()
+                assert val_metrics, f"{val_metrics=}"
+                pprint(f"Initial validation metrics: {val_metrics}")
+                logger.log(data=val_metrics, step=self.global_steps)
+                if self.config.trainer.get("val_only", False):
+                    run_succeeded = True
                     return
 
-                # this is experimental and may be changed/removed in the future
-                # in favor of a general-purpose data buffer pool
-                if hasattr(self.train_dataset, "on_batch_end"):
-                    # The dataset may be changed after each training batch
-                    self.train_dataset.on_batch_end(batch=batch)
+            if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
+                rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
+                rollout_skip.wrap_generate_sequences()
+
+            # add tqdm
+            progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+            # we start from step 1
+            self.global_steps += 1
+            last_val_metrics = None
+            self.max_steps_duration = 0
+
+            prev_step_profile = False
+            curr_step_profile = (
+                self.global_steps in self.config.global_profiler.steps
+                if self.config.global_profiler.steps is not None
+                else False
+            )
+            next_step_profile = False
+
+            for epoch in range(current_epoch, self.config.trainer.total_epochs):
+                for batch_dict in self.train_dataloader:
+                    if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                        self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
+                    metrics = {}
+                    timing_raw = {}
+
+                    with marked_timer("start_profile", timing_raw):
+                        self._start_profiling(
+                            not prev_step_profile and curr_step_profile
+                            if self.config.global_profiler.profile_continuous_steps
+                            else curr_step_profile
+                        )
+                    batch: DataProto = DataProto.from_single_dict(batch_dict)
+                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
+                    # add uid to batch
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
+
+                    gen_batch = self._get_gen_batch(batch)
+
+                    # pass global_steps to trace
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+
+                    current_adv_estimator = self.config.algorithm.adv_estimator
+                    current_rollout_repeat_times = int(self.config.actor_rollout_ref.rollout.n)
+                    three_mode_active = self._is_three_mode_active()
+                    metrics["three_mode_routing/active"] = float(three_mode_active)
+
+                    if not three_mode_active:
+                        gen_batch_output = gen_batch.repeat(
+                            repeat_times=current_rollout_repeat_times, interleave=True
+                        )
+                    else:
+                        # The three-mode forcer builds its own forced/free rollout mix.
+                        gen_batch_output = gen_batch
+
+                    is_last_step = self.global_steps >= self.total_training_steps
+                    three_mode_source_indices = None
+                    with marked_timer("step", timing_raw):
+                        # generate a batch
+                        with marked_timer("gen", timing_raw, color="red"):
+                            if not self.async_rollout_mode:
+                                generate_fn = self.actor_rollout_wg.generate_sequences
+                            else:
+                                generate_fn = self.async_rollout_manager.generate_sequences
+
+                            if three_mode_active:
+                                three_mode_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                                (
+                                    gen_batch_output,
+                                    three_mode_source_indices,
+                                    three_mode_rollout_metrics,
+                                ) = self._build_three_mode_rollouts(
+                                    gen_batch=gen_batch,
+                                    generate_fn=generate_fn,
+                                    dp_size=three_mode_dp_size,
+                                )
+                                metrics.update(three_mode_rollout_metrics)
+                            else:
+                                gen_batch_output = generate_fn(gen_batch_output)
+
+                            timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
+                            gen_batch_output.meta_info.pop("timing", None)
+
+                        if current_adv_estimator == AdvantageEstimator.REMAX:
+                            if self.reward_fn is None:
+                                raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+
+                            with marked_timer("gen_max", timing_raw, color="purple"):
+                                gen_baseline_batch = deepcopy(gen_batch)
+                                gen_baseline_batch.meta_info["do_sample"] = False
+                                if not self.async_rollout_mode:
+                                    gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                                else:
+                                    gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                                batch = batch.union(gen_baseline_output)
+                                # compute reward model score on batch
+                                rm_scores = None
+                                if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                    if not self.use_reward_loop:
+                                        rm_scores = self.rm_wg.compute_rm_score(batch)
+                                    else:
+                                        assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                                        rm_scores = self.reward_loop_manager.compute_rm_score(batch)
+                                    batch = batch.union(rm_scores)
+
+                                # Compute or extract reward for REMAX baseline
+                                reward_baseline_tensor = self._compute_or_extract_reward(
+                                    batch, reward_fn=self.reward_fn, sum_reward=True
+                                )
+
+                                keys_to_pop = set(gen_baseline_output.batch.keys())
+                                if rm_scores is not None:
+                                    keys_to_pop.update(rm_scores.batch.keys())
+                                batch.pop(batch_keys=list(keys_to_pop))
+
+                                batch.batch["reward_baselines"] = reward_baseline_tensor
+
+                                del rm_scores, gen_baseline_batch, gen_baseline_output
+                        if three_mode_active:
+                            if three_mode_source_indices is None:
+                                raise RuntimeError(
+                                    "Three-mode routing source indices were not returned."
+                                )
+                            current_rollout_repeat_times = 1
+                            batch.meta_info["rollout_repeat_times"] = 1
+                            batch = batch.select_idxs(three_mode_source_indices)
+                        else:
+                            batch.meta_info["rollout_repeat_times"] = current_rollout_repeat_times
+                            batch = batch.repeat(repeat_times=current_rollout_repeat_times, interleave=True)
+                        batch = batch.union(gen_batch_output)
+
+                        # Three-mode routing per-mode response cap.
+                        if (
+                            three_mode_active
+                            and self._three_mode_routing_forcer is not None
+                        ):
+                            tmr_cap_cfg = self._three_mode_routing_forcer.config
+                            if any(
+                                x is not None
+                                for x in (
+                                    tmr_cap_cfg.nothink_max_tokens,
+                                    tmr_cap_cfg.short_max_tokens,
+                                    tmr_cap_cfg.long_max_tokens,
+                                )
+                            ):
+                                # Pass the stored labels so forced rollouts keep their
+                                # known-certain mode instead of being re-detected (a
+                                # re-detection miss used to charge them unknown_penalty).
+                                cap_modes, was_truncated_by_cap = apply_three_mode_caps(
+                                    batch,
+                                    tokenizer=self.tokenizer,
+                                    config=tmr_cap_cfg,
+                                    known_modes=batch.non_tensor_batch.get("routing_mode"),
+                                    known_forced=batch.non_tensor_batch.get("routing_forced"),
+                                    routing_token_lengths=batch.non_tensor_batch.get("routing_token_length"),
+                                )
+                                batch.non_tensor_batch["routing_mode"] = cap_modes
+                                batch.non_tensor_batch["was_truncated_by_cap"] = was_truncated_by_cap
+                                batch.batch["response_mask"] = compute_response_mask(batch)
+                                # CRITICAL: the async reward loop scored the FULL response
+                                # during generation and cached it in rm_scores — BEFORE this
+                                # cap was applied. Using that stale score means an over-cap
+                                # response (answer beyond the cap) is still marked correct, so
+                                # the per-mode cap never creates the intended capability gap.
+                                # Drop rm_scores so the reward is recomputed below on the
+                                # CAPPED response (answer must fall within the cap to count).
+                                if "rm_scores" in batch.batch.keys():
+                                    batch.batch.pop("rm_scores")
+
+                        if "response_mask" not in batch.batch.keys():
+                            batch.batch["response_mask"] = compute_response_mask(batch)
+                        # Balance the number of valid tokens across DP ranks.
+                        # NOTE: This usually changes the order of data in the `batch`,
+                        # which won't affect the advantage calculation (since it's based on uid),
+                        # but might affect the loss calculation (due to the change of mini-batching).
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(batch, metrics=metrics)
+
+                        # compute global_valid tokens
+                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                if not self.use_reward_loop:
+                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                else:
+                                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                                    reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            # Compute or extract reward for training
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(
+                                    data=batch, config=self.config, tokenizer=self.tokenizer
+                                )
+                            else:
+                                reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
+                                    batch, reward_fn=self.reward_fn, return_dict=False
+                                )
+
+                        # Operating Mode Selection:
+                        # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                        # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+                        #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                        if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                            from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+
+                            apply_bypass_mode(
+                                batch=batch,
+                                rollout_corr_config=rollout_corr_config,
+                                policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                            )
+                        else:  # Recompute old_log_probs
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                                entropys = old_log_prob.batch["entropys"]
+                                response_masks = batch.batch["response_mask"]
+                                actor_config = self.config.actor_rollout_ref.actor
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys,
+                                    loss_mask=response_masks,
+                                    loss_agg_mode=actor_config.loss_agg_mode,
+                                    loss_scale_factor=actor_config.loss_scale_factor,
+                                )
+                                old_log_prob_metrics = {
+                                    "actor/entropy": entropy_agg.detach().item(),
+                                    "perf/mfu/actor_infer": old_log_prob_mfu,
+                                }
+                                metrics.update(old_log_prob_metrics)
+                                old_log_prob.batch.pop("entropys")
+                                batch = batch.union(old_log_prob)
+                                if "rollout_log_probs" in batch.batch.keys():
+                                    # TODO: we may want to add diff of probs too.
+                                    from verl.utils.debug.metrics import calculate_debug_metrics
+
+                                    metrics.update(calculate_debug_metrics(batch))
+
+                        assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+
+                        if self.use_reference_policy:
+                            # compute reference log_prob
+                            with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                                ref_log_prob = self._compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
+
+                        # compute values
+                        if self.use_critic:
+                            with marked_timer("values", timing_raw, color="cyan"):
+                                values = self._compute_values(batch)
+                                batch = batch.union(values)
+
+                        with marked_timer("adv", timing_raw, color="brown"):
+                            # we combine with rule-based rm
+                            reward_extra_infos_dict: dict[str, list]
+                            if self.config.reward_model.launch_reward_fn_async:
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            batch.batch["token_level_scores"] = reward_tensor
+
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                            # compute rewards. apply_kl_penalty if available
+                            if self.config.algorithm.use_kl_in_reward:
+                                batch, kl_metrics = apply_kl_penalty(
+                                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                )
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                            # Compute rollout correction: IS weights, rejection sampling, and metrics
+                            # Only runs in decoupled mode (computes once per batch using stable π_old)
+                            # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                            if (
+                                rollout_corr_config is not None
+                                and "rollout_log_probs" in batch.batch
+                                and not bypass_recomputing_logprobs  # Only in decoupled mode
+                            ):
+                                from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+                                # Compute IS weights, apply rejection sampling, compute metrics
+                                batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                                # IS and off-policy metrics already have rollout_corr/ prefix
+                                metrics.update(is_metrics)
+
+                            # compute advantages, executed on the driver process
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            )  # GRPO adv normalization factor
+
+                            batch.meta_info["global_steps"] = self.global_steps
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=current_adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=current_rollout_repeat_times,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                                tokenizer=self.tokenizer,
+                            )
+
+                            # ── Three-mode routing metrics ─────────────────────────────────
+                            if three_mode_active and "routing_mode" in batch.non_tensor_batch:
+                                seq_scores_tmr = batch.batch["token_level_rewards"].sum(dim=-1)
+                                is_correct_tmr = (seq_scores_tmr > 0.5).float()
+                                tmr_adv = batch.batch["advantages"]
+                                tmr_forced = batch.non_tensor_batch.get("routing_forced", None)
+                                tmr_gate_active = self._is_three_mode_warmup() and (
+                                    self._three_mode_routing_forcer.config.solved_gate_warmup_steps > 0
+                                    and self.global_steps <= self._three_mode_routing_forcer.config.solved_gate_warmup_steps
+                                )
+                                tmr_detail_metrics = compute_three_mode_routing_metrics(
+                                    routing_mode=batch.non_tensor_batch["routing_mode"],
+                                    is_correct=is_correct_tmr,
+                                    response_lengths=batch.batch["response_mask"].sum(dim=-1),
+                                    index=batch.non_tensor_batch["uid"],
+                                    advantages=tmr_adv,
+                                    routing_forced=tmr_forced,
+                                    gate_active=tmr_gate_active,
+                                    was_truncated_by_cap=batch.non_tensor_batch.get("was_truncated_by_cap"),
+                                )
+                                metrics.update(tmr_detail_metrics)
+                                _tmr_cfg_m = self._three_mode_routing_forcer.config
+                                metrics["three_mode_routing/balance_coef_effective"] = effective_balance_coef(
+                                    balance_coef=_tmr_cfg_m.balance_coef,
+                                    anneal_start_step=_tmr_cfg_m.balance_anneal_start_step,
+                                    anneal_end_step=_tmr_cfg_m.balance_anneal_end_step,
+                                    anneal_final_coef=_tmr_cfg_m.balance_anneal_final_coef,
+                                    global_step=self.global_steps,
+                                )
+
+                        # update critic
+                        if self.use_critic:
+                            with marked_timer("update_critic", timing_raw, color="pink"):
+                                critic_output = self._update_critic(batch)
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                            metrics.update(critic_output_metrics)
+
+                        # implement critic warmup
+                        if self.config.trainer.critic_warmup <= self.global_steps:
+                            # update actor
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                actor_output = self._update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
+
+                        # Log rollout generations if enabled
+                        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                        if rollout_data_dir:
+                            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                    # validate
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                    ):
+                        with marked_timer("testing", timing_raw, color="green"):
+                            val_metrics: dict = self._validate()
+                            if is_last_step:
+                                last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
+
+                    # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                    esi_close_to_expiration = should_save_ckpt_esi(
+                        max_steps_duration=self.max_steps_duration,
+                        redundant_time=self.config.trainer.esi_redundant_time,
+                    )
+                    # Check if the conditions for saving a checkpoint are met.
+                    # The conditions include a mandatory condition (1) and
+                    # one of the following optional conditions (2/3/4):
+                    # 1. The save frequency is set to a positive value.
+                    # 2. It's the last training step.
+                    # 3. The current step number is a multiple of the save frequency.
+                    # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                    if self.config.trainer.save_freq > 0 and (
+                        is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+                    ):
+                        if esi_close_to_expiration:
+                            print("Force saving checkpoint: ESI instance expiration approaching.")
+                        with marked_timer("save_checkpoint", timing_raw, color="green"):
+                            self._save_checkpoint()
+
+                    with marked_timer("stop_profile", timing_raw):
+                        next_step_profile = (
+                            self.global_steps + 1 in self.config.global_profiler.steps
+                            if self.config.global_profiler.steps is not None
+                            else False
+                        )
+                        self._stop_profiling(
+                            curr_step_profile and not next_step_profile
+                            if self.config.global_profiler.profile_continuous_steps
+                            else curr_step_profile
+                        )
+                        prev_step_profile = curr_step_profile
+                        curr_step_profile = next_step_profile
+
+                    steps_duration = timing_raw["step"]
+                    self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+                    # training metrics
+                    metrics.update(
+                        {
+                            "training/global_step": self.global_steps,
+                            "training/epoch": epoch,
+                        }
+                    )
+                    # collect metrics
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, tokenizer=self.tokenizer))
+                    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    # TODO: implement actual tflpo and theoretical tflpo
+                    n_gpus = self.resource_pool_manager.get_n_gpus()
+                    metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                    # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+
+                    # Difficulty-specific accuracy (e.g., levels 3 and 4).
+                    difficulty_metrics = compute_difficulty_metrics(batch=batch)
+                    metrics.update(difficulty_metrics)
+
+                    # Completion statistics: truncated vs finished and correctness.
+                    generation_budget = int(batch.batch["responses"].shape[-1])
+                    completion_metrics = compute_completion_metrics(batch=batch, generation_budget=generation_budget)
+                    metrics.update(completion_metrics)
+
+                    # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+                    if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+                        self.train_dataloader.sampler.update(batch=batch)
+
+                    # TODO: make a canonical logger that supports various backend
+                    logger.log(data=metrics, step=self.global_steps)
+
+                    progress_bar.update(1)
+                    self.global_steps += 1
+
+                    if (
+                        hasattr(self.config.actor_rollout_ref.actor, "profiler")
+                        and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+                    ):
+                        self.actor_rollout_wg.dump_memory_snapshot(
+                            tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
+                        )
+
+                    if is_last_step:
+                        if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                            self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                        run_succeeded = True
+                        return
+
+                    # this is experimental and may be changed/removed in the future
+                    # in favor of a general-purpose data buffer pool
+                    if hasattr(self.train_dataset, "on_batch_end"):
+                        # The dataset may be changed after each training batch
+                        self.train_dataset.on_batch_end(batch=batch)
+            run_succeeded = True
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
+            logger.finish(exit_code=0 if run_succeeded else 1)
