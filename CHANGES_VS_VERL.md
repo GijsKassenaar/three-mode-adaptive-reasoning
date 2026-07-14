@@ -36,6 +36,19 @@ commit of this repository is the unmodified verl v0.7.0 tree).
 | `verl/utils/tracking.py` | Idempotent `Tracking.finish(exit_code)` + `atexit` registration so W&B runs are closed (with a failure exit code) when a SLURM job dies mid-run. |
 | `verl/utils/tokenizer.py` | `hf_processor` disabled by default via `ENABLE_PROCESSOR = False` (returns `None`). Cluster workaround: `AutoProcessor` resolution is slow/fragile for the text-only models used here and the processor is unused. Flip the flag for multimodal models. |
 
+## CI
+
+Upstream verl's `.github/workflows/` (30 workflows), `CODEOWNERS`, `dependabot.yml`,
+and issue/PR templates were **removed**. They depend on volcengine's private
+infrastructure — self-hosted GPU runners provisioned via an internal API gateway,
+a private docker registry, and org-scoped secrets/tokens — none of which exist on a
+personal fork, so every one of those checks fails or hangs with "no runner" on any
+repository that isn't `volcengine/verl` itself. They were replaced with a single
+workflow, `cpu-tests.yml`, that installs a minimal dependency set and runs
+`tests/trainer/ppo/test_three_mode_routing_on_cpu.py` on a standard GitHub-hosted
+runner — verified locally in an isolated venv with that exact dependency list before
+being added.
+
 ## Everything else
 
 Identical to verl v0.7.0. In particular `verl/trainer/main_ppo.py`, all workers,
