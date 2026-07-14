@@ -1,0 +1,136 @@
+#!/bin/bash
+# BASELINE benchmark eval: the untrained base model (DeepSeek-R1-Distill-Qwen-1.5B) on the
+# external benchmarks, with NO routing — plain prompt, full reasoning up to 16k tokens.
+# This is the vanilla base-model number (comparable to what other papers report), to set
+# against the trained routing models.
+#   - AIME 2024 + AIME 2025  @ n=16  (avg@16)
+#   - MATH-500               @ n=5   (avg@5)
+#   - GSM8K                  @ n=5   (avg@5)
+#
+# vs eval_benchmarks_all.job: (1) resume_mode=disable -> loads HF weights from model.path,
+# no checkpoint; (2) adv_estimator=grpo + three_mode_routing OFF -> no routing question is
+# injected, the model just answers the plain \boxed{} prompt and reasons freely to 16384.
+#
+# Override: AIME_N=16, MATH500_N=5, GSM8K_N=5, DATA_ROOT=$PWD/data
+# Logs: eval_bench_{aime,math500,gsm8k}_base.log
+
+#SBATCH --job-name=eval_benchmarks_baseline
+#SBATCH --partition=gpu_h100
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=600G
+#SBATCH --time=04:00:00
+
+module purge
+module load 2025
+module load CUDA/12.8.0
+
+source ~/.bashrc
+conda activate zero
+
+unset ROCR_VISIBLE_DEVICES
+unset HIP_VISIBLE_DEVICES
+
+export HF_HOME=/scratch-shared/$USER/huggingface
+mkdir -p $HF_HOME
+export WANDB__SERVICE_WAIT=300
+export WANDB_DIR=/scratch-shared/$USER/wandb
+mkdir -p $WANDB_DIR
+
+cd "${REPO_DIR:-$HOME/three-mode-routing}"
+
+export N_GPUS=4
+export ROLLOUT_TP_SIZE=1
+export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+
+DATA_ROOT=${DATA_ROOT:-"$PWD/data"}
+AIME_N=${AIME_N:-16}
+MATH500_N=${MATH500_N:-5}
+GSM8K_N=${GSM8K_N:-5}
+STEP="base"
+
+echo "BASELINE (no routing, plain prompt, 16k): $BASE_MODEL | AIME n=$AIME_N | MATH500 n=$MATH500_N | GSM8K n=$GSM8K_N"
+
+# Dummy (never-iterated) train dataloader; large file so val_only's non-empty assert passes.
+DUMMY_TRAIN="$DATA_ROOT/gsm8k/train.parquet"
+
+# Args: <bench_tag> <val_files Hydra value> <n>
+run_eval () {
+    local TAG="$1" VAL_FILES="$2" N="$3"
+    local LOG="eval_bench_${TAG}_${STEP}.log"
+    local EXP="eval_bench_${TAG}_${STEP}"
+    echo ">>> $TAG : val_files=$VAL_FILES  n=$N  -> $LOG"
+    python3 -m verl.trainer.main_ppo \
+        data.train_files="$DUMMY_TRAIN" \
+        "data.val_files=$VAL_FILES" \
+        data.train_batch_size=256 \
+        data.val_batch_size=1000 \
+        data.dataloader_num_workers=2 \
+        data.max_prompt_length=2048 \
+        data.max_response_length=16384 \
+        actor_rollout_ref.model.path=$BASE_MODEL \
+        actor_rollout_ref.model.use_remove_padding=True \
+        actor_rollout_ref.actor.use_dynamic_bsz=True \
+        actor_rollout_ref.actor.optim.lr=1e-6 \
+        actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+        actor_rollout_ref.actor.ppo_micro_batch_size=8 \
+        actor_rollout_ref.actor.loss_agg_mode=token-mean \
+        actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
+        actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
+        actor_rollout_ref.rollout.n=4 \
+        actor_rollout_ref.rollout.prompt_length=2048 \
+        actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
+        actor_rollout_ref.rollout.name=vllm \
+        actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+        actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
+        actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+        actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+        actor_rollout_ref.rollout.val_kwargs.n=$N \
+        actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
+        critic.enable=False \
+        algorithm.adv_estimator=grpo \
+        algorithm.norm_adv_by_std_in_grpo=False \
+        algorithm.use_kl_in_reward=False \
+        trainer.n_gpus_per_node=$N_GPUS \
+        trainer.nnodes=1 \
+        trainer.resume_mode=disable \
+        trainer.total_training_steps=0 \
+        trainer.val_only=True \
+        trainer.val_before_train=True \
+        trainer.test_freq=1 \
+        trainer.save_freq=999999 \
+        trainer.logger=['console','wandb'] \
+        trainer.project_name=three-mode-routing \
+        trainer.experiment_name=$EXP \
+        trainer.default_local_dir=$EXP \
+        2>&1 | tee "$LOG"
+    local rc=${PIPESTATUS[0]}
+    if [ "$rc" -ne 0 ]; then
+        echo "!!! $TAG eval FAILED (exit $rc) — see $LOG"
+    else
+        echo "<<< $TAG eval OK"
+    fi
+}
+
+# ── AIME 2024 + 2025 together @ n=16 ─────────────────────────────────────────────
+run_eval "aime" \
+    "[$DATA_ROOT/aime2024/dev.parquet,$DATA_ROOT/aime2025/dev.parquet]" \
+    "$AIME_N"
+
+# ── MATH-500 @ n=5 ──────────────────────────────────────────────────────────────
+run_eval "math500" \
+    "$DATA_ROOT/math_lighteval/dev.parquet" \
+    "$MATH500_N"
+
+# ── GSM8K @ n=5 ─────────────────────────────────────────────────────────────────
+run_eval "gsm8k" \
+    "$DATA_ROOT/gsm8k/dev.parquet" \
+    "$GSM8K_N"
+
+echo ""
+echo "=== SUMMARY (baseline acc per benchmark) ==="
+grep -hoP "val-core/[^ ]*acc/mean@\d+:[0-9.]+" \
+    eval_bench_aime_${STEP}.log \
+    eval_bench_math500_${STEP}.log \
+    eval_bench_gsm8k_${STEP}.log 2>/dev/null | sort -u

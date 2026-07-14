@@ -1,0 +1,154 @@
+#!/bin/bash
+# TWO-MODE self-routing (NOTHINK + LONG) on MATH-lighteval.
+#
+# Motivation (from forced-mode evals on a trained three-mode checkpoint):
+#   forced-LONG    0.784 @ 2680 tok   (reasoning intact ≈ baseline)
+#   forced-NOTHINK 0.748 @ 1780 tok   (clean, efficient cheap mode)
+#   forced-SHORT   0.712 @ 2219 tok   (Pareto-DOMINATED by NOTHINK: more tokens, less
+#                                       accuracy; under-trained; "truncated-CoT valley")
+# SHORT adds nothing to the accuracy/token frontier here, so we drop it and run a binary
+# router: easy -> NOTHINK (real token savings), hard -> LONG (full accuracy).  Reasoning
+# is already intact (forced-LONG ≈ 0.78), so this run only re-learns the routing DECISION.
+#
+# Implemented via the (debugged, two-pass-fixed) three-mode pipeline with the reversible
+# enabled_modes flag:
+#   algorithm.three_mode_routing.enabled_modes="nothink,long"
+# Only NOTHINK/LONG are forced during warmup and detected in free rollouts; a free rollout
+# that emits SHORT is scored as unknown (penalized), so the model learns to abandon it.
+# balance_target is set to 0.5 (1/n_modes) and the forced floor is 1 per mode = 2 forced.
+#
+# Reward calibration (conservative cheap mode, the knobs to tune for accuracy↔tokens):
+#   - NOTHINK: base 1.2, wrong -0.5  -> only route NOTHINK when confident (gamble punished)
+#   - LONG:    base 1.0, wrong  0.0
+#   - gammas 1.0 (no length discount; the NOTHINK cap 1024 enforces brevity)
+# Balance push 0.5 toward 50/50 for steps 80..100, annealed to 0 over 100..120 so the
+# final split settles at the difficulty-appropriate equilibrium rather than a forced half.
+#
+# Resumes the checkpoint given via SRC_CKPT (a trained three-mode checkpoint dir with
+# actor/) and continues training under the 2-mode detection.  val_before_train records
+# the source model under 2-mode detection (its free SHORT emissions now read as
+# unknown — expected until it retrains).
+
+#SBATCH --job-name=tmr_two_mode_nothink_long_math
+#SBATCH --partition=gpu_h100
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=600G
+#SBATCH --time=04:00:00
+
+module purge
+module load 2025
+module load CUDA/12.8.0
+
+source ~/.bashrc
+conda activate zero
+
+unset ROCR_VISIBLE_DEVICES
+unset HIP_VISIBLE_DEVICES
+
+export HF_HOME=/scratch-shared/$USER/huggingface
+mkdir -p $HF_HOME
+export WANDB__SERVICE_WAIT=300
+export WANDB_DIR=/scratch-shared/$USER/wandb
+mkdir -p $WANDB_DIR
+
+cd "${REPO_DIR:-$HOME/three-mode-routing}"
+
+export N_GPUS=4
+export ROLLOUT_TP_SIZE=1
+export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+
+export DATA_DIR=${DATA_DIR:-"$PWD/data/math_lighteval"}
+export TRAIN_FILE="$DATA_DIR/train.parquet"
+export VAL_FILE="$DATA_DIR/dev.parquet"
+
+export EXPERIMENT_NAME=two_mode_nothink_long_math
+
+# ── Stage a resume dir with the source weights but NO data.pt ───────────────────
+# SRC_CKPT must point at a trained three-mode checkpoint dir (containing actor/),
+# e.g. a step from train_three_mode_routing_math.job. Dropping data.pt starts the
+# dataloader fresh on MATH-lighteval; actor is symlinked (no copy);
+# del_local_ckpt_after_load=False keeps the originals untouched.
+export SRC_CKPT="${SRC_CKPT:?Set SRC_CKPT=<path to source checkpoint dir containing actor/>}"
+export RESUME_DIR="$PWD/two_mode_nothink_long_math_resume/$(basename "$SRC_CKPT")"
+if [ ! -d "$SRC_CKPT/actor" ]; then
+    echo "ERROR: source checkpoint $SRC_CKPT/actor not found" >&2
+    exit 1
+fi
+mkdir -p "$RESUME_DIR"
+ln -sfn "$SRC_CKPT/actor" "$RESUME_DIR/actor"
+
+python3 -m verl.trainer.main_ppo \
+    data.train_files=$TRAIN_FILE \
+    data.val_files=$VAL_FILE \
+    data.train_batch_size=128 \
+    data.val_batch_size=256 \
+    data.dataloader_num_workers=2 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=16384 \
+    data.filter_overlong_prompts=True \
+    actor_rollout_ref.model.path=$BASE_MODEL \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size=8 \
+    actor_rollout_ref.actor.loss_agg_mode=token-mean \
+    actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.prompt_length=2048 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
+    critic.enable=False \
+    algorithm.adv_estimator=three_mode_routing \
+    algorithm.gamma=1.0 \
+    algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.use_kl_in_reward=False \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    algorithm.three_mode_routing.enable=True \
+    "algorithm.three_mode_routing.enabled_modes='nothink,long'" \
+    algorithm.three_mode_routing.nothink_token=NOTHINK \
+    algorithm.three_mode_routing.short_token=SHORT \
+    algorithm.three_mode_routing.long_token=LONG \
+    algorithm.three_mode_routing.nothink_base=1.05 \
+    algorithm.three_mode_routing.long_base=1.0 \
+    algorithm.three_mode_routing.nothink_wrong_penalty=-0.5 \
+    algorithm.three_mode_routing.long_wrong_penalty=0.0 \
+    algorithm.three_mode_routing.gamma_nothink=1.0 \
+    algorithm.three_mode_routing.gamma_long=1.0 \
+    algorithm.three_mode_routing.unknown_penalty=-1.0 \
+    algorithm.three_mode_routing.exclude_unknown_from_mean_start_step=0 \
+    algorithm.three_mode_routing.warmup_steps=0 \
+    algorithm.three_mode_routing.warmup2_steps=10000 \
+    algorithm.three_mode_routing.n_rollouts=8 \
+    algorithm.three_mode_routing.nothink_max_tokens=2000 \
+    algorithm.three_mode_routing.long_max_tokens=16384 \
+    algorithm.three_mode_routing.balance_coef=0.25 \
+    "algorithm.three_mode_routing.balance_target=0.5" \
+    algorithm.three_mode_routing.balance_anneal_start_step=100 \
+    algorithm.three_mode_routing.balance_anneal_end_step=120 \
+    algorithm.three_mode_routing.balance_anneal_final_coef=0.0 \
+    algorithm.three_mode_routing.two_pass_enable=True \
+    algorithm.three_mode_routing.router_pass_tokens=8 \
+    algorithm.three_mode_routing.unknown_early_stop=True \
+    trainer.n_gpus_per_node=$N_GPUS \
+    trainer.nnodes=1 \
+    trainer.resume_mode=auto \
+    trainer.total_training_steps=90 \
+    trainer.save_freq=20 \
+    trainer.test_freq=10 \
+    trainer.val_before_train=True \
+    trainer.val_only=True \
+    trainer.logger=['console','wandb'] \
+    trainer.project_name=three-mode-routing \
+    trainer.experiment_name=$EXPERIMENT_NAME \
+    trainer.default_local_dir=$EXPERIMENT_NAME \
+    2>&1 | tee "two_mode_nothink_long_math.log"

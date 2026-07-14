@@ -1,0 +1,163 @@
+#!/bin/bash
+# Run ALL external benchmarks in one job, each at its appropriate sample count:
+#   - AIME 2024 + AIME 2025  @ n=16  (avg@16 — single-year 30Q sets are noisy)
+#   - MATH-500               @ n=5   (500 problems, avg@5 for variance reduction)
+#   - GSM8K                  @ n=5   (1319 problems, avg@5)
+#
+# Three val_only passes on the SAME checkpoint (val_kwargs.n is global per call).
+# Each pass reports per-data_source accuracy: val-core/.../acc/mean@<n>.
+#
+# Override via env:
+#   CHECKPOINT=<dir with actor/>   (required)
+#   VAL_MODE=FREE|NOTHINK|SHORT|LONG   (default: FREE)
+#   AIME_N=16   MATH500_N=5   GSM8K_N=5
+#   DATA_ROOT=$PWD/data
+#
+# Logs: eval_bench_{aime,math500,gsm8k}_<MODE>_step<STEP>.log
+
+#SBATCH --job-name=eval_benchmarks_all
+#SBATCH --partition=gpu_h100
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=600G
+#SBATCH --time=04:00:00
+
+module purge
+module load 2025
+module load CUDA/12.8.0
+
+source ~/.bashrc
+conda activate zero
+
+unset ROCR_VISIBLE_DEVICES
+unset HIP_VISIBLE_DEVICES
+
+export HF_HOME=/scratch-shared/$USER/huggingface
+mkdir -p $HF_HOME
+export WANDB__SERVICE_WAIT=300
+export WANDB_DIR=/scratch-shared/$USER/wandb
+mkdir -p $WANDB_DIR
+
+cd "${REPO_DIR:-$HOME/three-mode-routing}"
+
+export N_GPUS=4
+export ROLLOUT_TP_SIZE=1
+export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+
+DATA_ROOT=${DATA_ROOT:-"$PWD/data"}
+VAL_MODE=${VAL_MODE:-"LONG"}
+AIME_N=${AIME_N:-16}
+MATH500_N=${MATH500_N:-5}
+GSM8K_N=${GSM8K_N:-5}
+
+# Checkpoint override priority: positional arg $1 > env CHECKPOINT > default.
+# Use the POSITIONAL form ('sbatch eval_benchmarks_all.job <ckpt>') — SLURM always forwards
+# script args, whereas inline 'CHECKPOINT=.. sbatch' depends on the site's --export default
+# (which on this cluster does NOT propagate it, so env override was silently ignored).
+CHECKPOINT="${1:-${CHECKPOINT:?Set CHECKPOINT=<checkpoint dir containing actor/> (or pass as first arg)}}"
+if [[ "$CHECKPOINT" != /* ]]; then
+    CHECKPOINT="${REPO_DIR:-$HOME/three-mode-routing}/$CHECKPOINT"
+fi
+if [ ! -d "$CHECKPOINT/actor" ]; then
+    echo "ERROR: checkpoint $CHECKPOINT/actor not found" >&2
+    exit 1
+fi
+STEP=$(basename "$CHECKPOINT" | grep -oP '(?<=global_step_)\d+' || echo "unknown")
+
+echo "Checkpoint: $CHECKPOINT (step $STEP) | mode: $VAL_MODE | AIME n=$AIME_N | MATH500 n=$MATH500_N | GSM8K n=$GSM8K_N"
+
+# val_only still builds a (never-iterated) train dataloader and asserts it is non-empty.
+# Tiny val sets like AIME (30 rows) would make their own train file < train_batch_size and
+# crash with "Train dataloader is empty!". So point the dummy train at a large file (gsm8k
+# train, 7473 rows) for ALL passes — it is loaded but never used for val_only.
+DUMMY_TRAIN="$DATA_ROOT/gsm8k/train.parquet"
+
+# ── Common val-only invocation. Args: <bench_tag> <val_files Hydra value> <n>
+run_eval () {
+    local TAG="$1" VAL_FILES="$2" N="$3"
+    local LOG="eval_bench_${TAG}_${VAL_MODE}_step${STEP}.log"
+    local EXP="eval_bench_${TAG}_${VAL_MODE}_step${STEP}"
+    echo ">>> $TAG : val_files=$VAL_FILES  n=$N  -> $LOG"
+    python3 -m verl.trainer.main_ppo \
+        data.train_files="$DUMMY_TRAIN" \
+        "data.val_files=$VAL_FILES" \
+        data.train_batch_size=256 \
+        data.val_batch_size=1000 \
+        data.dataloader_num_workers=2 \
+        data.max_prompt_length=2048 \
+        data.max_response_length=16384 \
+        actor_rollout_ref.model.path=$BASE_MODEL \
+        actor_rollout_ref.model.use_remove_padding=True \
+        actor_rollout_ref.actor.use_dynamic_bsz=True \
+        actor_rollout_ref.actor.optim.lr=1e-6 \
+        actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+        actor_rollout_ref.actor.ppo_micro_batch_size=8 \
+        actor_rollout_ref.actor.loss_agg_mode=token-mean \
+        actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
+        actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
+        actor_rollout_ref.rollout.n=4 \
+        actor_rollout_ref.rollout.prompt_length=2048 \
+        actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
+        actor_rollout_ref.rollout.name=vllm \
+        actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+        actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
+        actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+        actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+        actor_rollout_ref.rollout.val_kwargs.n=$N \
+        actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
+        critic.enable=False \
+        algorithm.adv_estimator=three_mode_routing \
+        algorithm.norm_adv_by_std_in_grpo=False \
+        algorithm.use_kl_in_reward=False \
+        algorithm.three_mode_routing.enable=True \
+        algorithm.three_mode_routing.nothink_token=NOTHINK \
+        algorithm.three_mode_routing.short_token=SHORT \
+        algorithm.three_mode_routing.long_token=LONG \
+        algorithm.three_mode_routing.nothink_max_tokens=1024 \
+        algorithm.three_mode_routing.short_max_tokens=3000 \
+        algorithm.three_mode_routing.long_max_tokens=16384 \
+        "algorithm.three_mode_routing.val_forced_mode=${VAL_MODE,,}" \
+        trainer.n_gpus_per_node=$N_GPUS \
+        trainer.nnodes=1 \
+        trainer.resume_mode=resume_path \
+        trainer.resume_from_path=$CHECKPOINT \
+        trainer.total_training_steps=0 \
+        trainer.val_only=True \
+        trainer.val_before_train=True \
+        trainer.test_freq=1 \
+        trainer.save_freq=999999 \
+        trainer.logger=['console','wandb'] \
+        trainer.project_name=three-mode-routing \
+        trainer.experiment_name=$EXP \
+        trainer.default_local_dir=$EXP \
+        2>&1 | tee "$LOG"
+    local rc=${PIPESTATUS[0]}
+    if [ "$rc" -ne 0 ]; then
+        echo "!!! $TAG eval FAILED (exit $rc) — see $LOG"
+    else
+        echo "<<< $TAG eval OK"
+    fi
+}
+
+# ── AIME 2024 + 2025 together @ n=16 (both reported separately by data_source) ──
+run_eval "aime" \
+    "[$DATA_ROOT/aime2024/dev.parquet,$DATA_ROOT/aime2025/dev.parquet]" \
+    "$AIME_N"
+
+# ── MATH-500 @ n=5 ──────────────────────────────────────────────────────────────
+run_eval "math500" \
+    "$DATA_ROOT/math_lighteval/dev.parquet" \
+    "$MATH500_N"
+
+# ── GSM8K @ n=5 ─────────────────────────────────────────────────────────────────
+run_eval "gsm8k" \
+    "$DATA_ROOT/gsm8k/dev.parquet" \
+    "$GSM8K_N"
+
+echo ""
+echo "=== SUMMARY (acc per benchmark) ==="
+grep -hoP "val-core/[^ ]*acc/mean@\d+:[0-9.]+" \
+    eval_bench_aime_${VAL_MODE}_step${STEP}.log \
+    eval_bench_math500_${VAL_MODE}_step${STEP}.log \
+    eval_bench_gsm8k_${VAL_MODE}_step${STEP}.log 2>/dev/null | sort -u

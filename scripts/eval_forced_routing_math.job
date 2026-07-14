@@ -1,0 +1,145 @@
+#!/bin/bash
+# Forced-mode validation for three-mode routing checkpoints.
+#
+# Forces all validation prompts into a single routing mode so per-mode accuracy
+# and length can be compared without stochastic routing noise.  Validation is
+# UNCAPPED (apply_caps_in_validation=False), so forced-LONG = full reasoning on
+# every problem — directly comparable to the ~0.80 untrained baseline.
+#
+# DIAGNOSTIC: forced-LONG on a trained routing checkpoint answers
+# "is the base reasoning intact, or did training degrade it?":
+#   - forced-LONG ≈ 0.80  -> reasoning intact; the 0.76 free-routing gap is purely
+#                            over-eager cheap routing -> fix via reward calibration.
+#   - forced-LONG  < 0.80 -> training degraded reasoning -> also need KL-to-base /
+#                            lower LR / fewer steps.
+# Run FREE on the same checkpoint to reproduce the ~0.76 routed val for reference,
+# and NOTHINK/SHORT for the per-mode ceilings.
+#
+# Usage (override via env vars):
+#   VAL_MODE=LONG    CHECKPOINT=<ckpt dir>/global_step_90  sbatch scripts/eval_forced_routing_math.job
+#   VAL_MODE=FREE    CHECKPOINT=<ckpt dir>/global_step_90  sbatch scripts/eval_forced_routing_math.job
+#   VAL_MODE=NOTHINK CHECKPOINT=...  sbatch scripts/eval_forced_routing_math.job
+#
+# VAL_MODE: NOTHINK | SHORT | LONG | FREE (default: LONG)
+# CHECKPOINT: path to checkpoint dir, absolute or relative to the repo root
+#             (must contain an actor/ subdir)
+#
+# Outputs are logged to eval_forced_routing_<MODE>_step<STEP>.log
+
+#SBATCH --job-name=eval_forced_routing_math
+#SBATCH --partition=gpu_h100
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=600G
+#SBATCH --time=01:00:00
+
+module purge
+module load 2025
+module load CUDA/12.8.0
+
+source ~/.bashrc
+conda activate zero
+
+unset ROCR_VISIBLE_DEVICES
+unset HIP_VISIBLE_DEVICES
+
+export HF_HOME=/scratch-shared/$USER/huggingface
+mkdir -p $HF_HOME
+export WANDB__SERVICE_WAIT=300
+export WANDB_DIR=/scratch-shared/$USER/wandb
+mkdir -p $WANDB_DIR
+
+cd "${REPO_DIR:-$HOME/three-mode-routing}"
+
+export N_GPUS=4
+export ROLLOUT_TP_SIZE=1
+export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+
+export DATA_DIR=${DATA_DIR:-"$PWD/data/math_lighteval"}
+export TRAIN_FILE="$DATA_DIR/train.parquet"
+export VAL_FILE="$DATA_DIR/dev.parquet"
+
+# Routing mode to force. FREE = let the model choose (standard free validation).
+export VAL_MODE=${VAL_MODE:-"NOTHINK"}
+
+# Checkpoint to evaluate. Must contain actor/ subdirectory.
+export CHECKPOINT="${CHECKPOINT:?Set CHECKPOINT=<checkpoint dir containing actor/>}"
+# Resolve to absolute path if not already absolute
+if [[ "$CHECKPOINT" != /* ]]; then
+    CHECKPOINT="${REPO_DIR:-$HOME/three-mode-routing}/$CHECKPOINT"
+fi
+
+# Extract step number from checkpoint path for log naming
+STEP=$(basename "$CHECKPOINT" | grep -oP '(?<=global_step_)\d+' || echo "unknown")
+LOG_FILE="eval_forced_routing_${VAL_MODE}_step${STEP}.log"
+
+export EXPERIMENT_NAME="eval_forced_routing_${VAL_MODE}_step${STEP}"
+
+echo "Mode: $VAL_MODE | Checkpoint: $CHECKPOINT | Step: $STEP"
+
+python3 -m verl.trainer.main_ppo \
+    data.train_files=$TRAIN_FILE \
+    data.val_files=$VAL_FILE \
+    data.train_batch_size=256 \
+    data.val_batch_size=1000 \
+    data.dataloader_num_workers=2 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=16384 \
+    actor_rollout_ref.model.path=$BASE_MODEL \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size=8 \
+    actor_rollout_ref.actor.loss_agg_mode=token-mean \
+    actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
+    actor_rollout_ref.rollout.n=4 \
+    actor_rollout_ref.rollout.prompt_length=2048 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6\
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
+    critic.enable=False \
+    algorithm.adv_estimator=three_mode_routing \
+    algorithm.gamma=1.0 \
+    algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.use_kl_in_reward=False \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    algorithm.three_mode_routing.enable=True \
+    algorithm.three_mode_routing.nothink_token=NOTHINK \
+    algorithm.three_mode_routing.short_token=SHORT \
+    algorithm.three_mode_routing.long_token=LONG \
+    algorithm.three_mode_routing.nothink_base=1.4 \
+    algorithm.three_mode_routing.short_base=1.3 \
+    algorithm.three_mode_routing.long_base=1.0 \
+    algorithm.three_mode_routing.gamma_nothink=0.99984 \
+    algorithm.three_mode_routing.gamma_short=0.9999 \
+    algorithm.three_mode_routing.unknown_penalty=-0.5 \
+    algorithm.three_mode_routing.warmup_steps=25 \
+    algorithm.three_mode_routing.n_rollouts=4 \
+    algorithm.three_mode_routing.nothink_max_tokens=1024 \
+    algorithm.three_mode_routing.short_max_tokens=3000 \
+    algorithm.three_mode_routing.long_max_tokens=16384 \
+    algorithm.three_mode_routing.balance_coef=0.5 \
+    "algorithm.three_mode_routing.balance_target=0.3333" \
+    "algorithm.three_mode_routing.val_forced_mode=${VAL_MODE,,}" \
+    trainer.n_gpus_per_node=$N_GPUS \
+    trainer.nnodes=1 \
+    trainer.resume_mode=resume_path \
+    trainer.resume_from_path=$CHECKPOINT \
+    trainer.total_training_steps=0 \
+    trainer.val_only=True \
+    trainer.val_before_train=True \
+    trainer.test_freq=1 \
+    trainer.save_freq=999999 \
+    trainer.logger=['console','wandb'] \
+    trainer.project_name=three-mode-routing \
+    trainer.experiment_name=$EXPERIMENT_NAME \
+    trainer.default_local_dir=$EXPERIMENT_NAME \
+    2>&1 | tee "$LOG_FILE"
