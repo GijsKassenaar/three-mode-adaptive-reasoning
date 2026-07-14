@@ -119,10 +119,8 @@ Fresh start from `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`; two phases in one 
 | Script | What it isolates |
 |---|---|
 | `scripts/train_forced_single_mode_math.job` (`MODE=NOTHINK\|SHORT\|LONG`) | per-mode floor/ceiling: every rollout forced into one mode for the whole run, validation forced into the same mode |
-| `scripts/train_two_mode_short_long_math.job` | drop NOTHINK (`enabled_modes="short,long"`), balance target 1/2 |
 | `scripts/train_two_mode_nothink_long_math.job` (`SRC_CKPT=<ckpt>`) | drop SHORT, continue a trained checkpoint as a binary router |
 | `scripts/train_three_mode_routing_bigmath.job` | same recipe on the Big-Math-RL-Verified distribution |
-| `scripts/train_grpo_baseline_math.job` | plain GRPO, identical budget/hparams, no routing |
 | `scripts/train_three_mode_family_seeds.job` | SLURM array: {forced-NOTHINK, forced-SHORT, forced-LONG, adaptive} × seeds |
 
 Flat-reward shaping (caps + balance only) is phase 2 of the main run; a caps-only
@@ -137,9 +135,6 @@ VAL_MODE=LONG CHECKPOINT=<ckpt_dir>/global_step_90 sbatch scripts/eval_forced_ro
 # GSM8K (avg@5), MATH-500 (avg@5), AIME'24+'25 (avg@16) on one checkpoint:
 sbatch scripts/eval_benchmarks_all.job <ckpt_dir>/global_step_90
 sbatch scripts/eval_benchmarks_baseline.job      # untrained base model reference
-
-# 'No-thinking' baseline (forces </think> after the prompt, agent.nothink=true):
-sbatch scripts/eval_nothink_baseline.job
 ```
 
 Validation is **uncapped** by default (it measures production behaviour — free
