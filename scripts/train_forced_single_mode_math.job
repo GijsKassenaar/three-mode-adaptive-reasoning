@@ -15,15 +15,17 @@
 # routing token itself (it's always prefilled), so free validation would just
 # measure whether it copies a token it never had to choose.
 #
-# Everything below is an EXACT copy of train_three_mode_routing_math.job's
-# hyperparameters (batch_size=128, rollout.n=8, reasoning_only=True, bases
-# 1.3/1.2/1.0, gamma_short=0.99994, balance_* flags) so results are directly
-# comparable to that run — the ONLY intentional differences are:
+# Everything below matches train_three_mode_routing_math.job's reward-surface
+# hyperparameters (batch_size=128, bases 1.3/1.2/1.0, gamma_nothink=0.99984,
+# gamma_short=0.99994, balance_* flags) so results are directly comparable to
+# that run — the intentional differences are:
 #   - train_forced_mode / val_forced_mode / enabled_modes (this is what makes it
 #     a forced single-mode ablation instead of adaptive routing)
-#   - fresh start from the base model for the full 90 steps (no resume_from_path):
-#     the ablation asks "what if trained in this one mode from step 0", not
-#     "continue an already-routed checkpoint in one mode"
+#   - rollout.n / n_rollouts = 4 (not 8) and a single 45-step phase (not 90):
+#     fresh start from the base model, resume_mode=disable so a re-submitted
+#     job always starts over rather than continuing a stale checkpoint dir —
+#     the ablation asks "what if trained in this one mode from step 0 for the
+#     warmup-length window", not "continue an already-routed checkpoint"
 # balance_coef/balance_target/balance_correctness_gated/balance_protect_long_incorrect
 # are kept at the balgated values even though they are no-ops here (balance_free_only
 # excludes forced rollouts from the balance fraction, and every rollout is forced).
@@ -159,7 +161,7 @@ python3 -m verl.trainer.main_ppo \
     "algorithm.three_mode_routing.val_forced_mode=${MODE_LC}" \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.resume_mode=auto \
+    trainer.resume_mode=disable \
     trainer.total_training_steps=45 \
     trainer.save_freq=45 \
     trainer.test_freq=15 \
