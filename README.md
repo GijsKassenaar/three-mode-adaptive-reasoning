@@ -104,14 +104,7 @@ generation time from the standard parquets.
 sbatch scripts/train_three_mode_routing_math.job
 ```
 
-Fresh start from `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`; two phases in one job:
-
-- **Phase 1 (steps 1–60):** shaped rewards — bases 1.3/1.2/1.0, γ_nothink 0.99984,
-  γ_short 0.99994, caps 1024/3000/16384, reasoning-only discount, warmup forcing for 45
-  steps, balance coef 1.0 (correctness-gated + LONG-protected).
-- **Phase 2 (steps 61–90):** bases and gammas flattened to 1.0 — mode separation is
-  maintained by the caps + balance term alone, while the balance coef anneals to 0
-  (steps 60→85) so the final split settles at the difficulty-appropriate equilibrium.
+Fresh start from `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`;
 
 ### Ablations
 
@@ -119,9 +112,6 @@ Fresh start from `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`; two phases in one 
 |---|---|
 | `scripts/train_forced_single_mode_math.job` (`MODE=NOTHINK\|SHORT\|LONG`) | per-mode floor/ceiling: every rollout forced into one mode for the whole run, validation forced into the same mode |
 | `scripts/train_three_mode_family_seeds.job` | SLURM array: {forced-NOTHINK, forced-SHORT, forced-LONG, adaptive} × seeds |
-
-Flat-reward shaping (caps + balance only) is phase 2 of the main run; a caps-only
-variant is one override away (`algorithm.three_mode_routing.balance_coef=0`).
 
 ### Evaluation
 
@@ -133,11 +123,6 @@ VAL_MODE=LONG CHECKPOINT=<ckpt_dir>/global_step_90 sbatch scripts/eval_forced_ro
 sbatch scripts/eval_benchmarks_all.job <ckpt_dir>/global_step_90
 sbatch scripts/eval_benchmarks_baseline.job      # untrained base model reference
 ```
-
-Validation is **uncapped** by default (it measures production behaviour — free
-generation, no truncation harness); set
-`algorithm.three_mode_routing.apply_caps_in_validation=True` to score the trained
-(capped) objective instead.
 
 The per-difficulty routing-split figure is produced from any training/eval log with:
 
