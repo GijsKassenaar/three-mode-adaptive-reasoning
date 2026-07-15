@@ -1188,18 +1188,6 @@ class RayPPOTrainer:
                     metric_dict["val-aux/truncated_by_length/correct_fraction"] = float(
                         truncated_arr[correct_mask].mean()
                     )
-                # Per-routing-mode truncation fraction (useful for spotting which mode hits its cap)
-                if three_mode_routing_val_enabled and len(sample_routing_modes) >= n:
-                    modes_arr = np.asarray(
-                        [str(m).lower() for m in sample_routing_modes[:n]], dtype=object
-                    )
-                    for mode in ("nothink", "short", "long"):
-                        mode_mask = modes_arr == mode
-                        if mode_mask.any():
-                            metric_dict[f"val-aux/truncated_by_length/{mode}_fraction"] = float(
-                                truncated_arr[mode_mask].mean()
-                            )
-
         if three_mode_routing_val_enabled and len(sample_routing_modes) > 0 and len(sample_is_correct) > 0:
             n = min(len(sample_routing_modes), len(sample_is_correct), len(sample_response_lengths), len(sample_uids))
             tmr_val_metrics = compute_three_mode_routing_metrics(
