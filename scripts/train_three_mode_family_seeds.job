@@ -300,7 +300,7 @@ else
         "algorithm.three_mode_routing.balance_anneal_end_step=90"
         "algorithm.three_mode_routing.balance_anneal_final_coef=0.0"
         "trainer.resume_mode=auto"
-        "trainer.total_training_steps=90"
+        "trainer.total_training_steps=45"
         "trainer.save_freq=45"
         "trainer.test_freq=15"
     )
