@@ -2,22 +2,11 @@
 # Job array: {forced NOTHINK, forced SHORT, forced LONG, adaptive balgated} x 2 NEW data
 # seeds = 8 runs, one Slurm array task each (throttled to 1 concurrent via %1).
 #
-# Only 2 seeds per config, not 3: each config already has one existing/queued run with no
-# explicit seed override (train_forced_single_mode_math.job x3 and the fresh 0->45
-# balgated run, see reports/three_mode_routing_addendum_2026-07-08.md) -- that existing run
-# effectively used the framework's own defaults (actor.data_loader_seed=1,
-# actor/ref fsdp_config.seed=42; data.seed itself was left null / unseeded). This script
-# adds 2 MORE seeded runs per config on top of that. Default new seeds are 2,3 --
-# deliberately skipping 1, since 1 is verl's own default actor.data_loader_seed (used
-# by the existing unseeded run), to keep every run's seed distinct from that default.
-#
 # Configs:
 #   - forced_nothink / forced_short / forced_long: every rollout forced into that one mode
-#     for the whole run, n_rollouts=4, 90 steps, single phase, same reward-surface recipe as
+#     for the whole run, n_rollouts=4, 45 steps, single phase, same reward-surface recipe as
 #     train_forced_single_mode_math.job (bases 1.3/1.2/1.0, gamma_nothink=0.99984,
-#     gamma_short=0.99994, gamma_long=1.0, reasoning_only=False, both balance flags) except
-#     for the step count: the seeded replication runs 90 steps here (matching the balgated
-#     phases below) rather than the 45 steps used by the original unseeded ablation.
+#     gamma_short=0.99994, gamma_long=1.0, reasoning_only=False, both balance flags).
 #   - balgated: free/adaptive three-mode routing, n_rollouts=8, FULL 90-STEP run in TWO
 #     PHASES within the same task/allocation, replicating jobs 24314950+24329987 from the
 #     addendum report:
@@ -25,9 +14,7 @@
 #                                            gamma_nothink=0.99984, gamma_short=0.99994)
 #       phase 2 (resume from step 60, steps 61-90): gammas/bases flattened to 1.0/1.0/1.0
 #                                            (caps + balance term only, no differential
-#                                            reward) -- exactly the ablation job B ran.
-#     Both phases keep reasoning_only=False, balance_correctness_gated=True,
-#     balance_protect_long_incorrect=True throughout.
+#                                            reward).
 #
 # Data seed wiring: data.seed drives the train_dataloader's RandomSampler (which batches
 # get shuffled into which step -- see verl/trainer/main_ppo.py::create_rl_sampler).
@@ -238,7 +225,7 @@ if [[ "$CONFIG" == "balgated" ]]; then
 
     RESUME_CKPT="$CKPT_DIR/global_step_60"
 
-    # ---- Phase 2: resume from step 60, gammas/bases flattened to 1.0, steps 61 -> 90 ----
+    # ---- Phase 2: resume from step 60, steps 61 -> 90 ----
     PHASE2_ARGS=(
         "${BASE_ARGS[@]}"
         "actor_rollout_ref.rollout.n=8"
