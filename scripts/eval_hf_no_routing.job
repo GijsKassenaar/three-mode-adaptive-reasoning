@@ -1,20 +1,28 @@
 #!/bin/bash
-# BASELINE benchmark eval: the untrained base model (DeepSeek-R1-Distill-Qwen-1.5B) on the
-# external benchmarks, with NO routing — plain prompt, full reasoning up to 16k tokens.
-# This is the vanilla base-model number (comparable to what other papers report), to set
-# against the trained routing models.
-#   - AIME 2024 + AIME 2025  @ n=16  (avg@16)
-#   - MATH-500               @ n=5   (avg@5)
-#   - GSM8K                  @ n=5   (avg@5)
+# Evaluate a HuggingFace model with NO routing question, under the paper's
+# benchmark protocol (same as scripts/eval_benchmarks_baseline.job):
+#   - AIME 2024 + AIME 2025  @ n=16
+#   - MATH-500               @ n=5
+#   - GSM8K                  @ n=5
+#   temperature 0.6, top_p 1.0, max response 16384, boxed MATH scorer
 #
-# vs eval_benchmarks_all.job: (1) resume_mode=disable -> loads HF weights from model.path,
-# no checkpoint; (2) adv_estimator=grpo + three_mode_routing OFF -> no routing question is
-# injected, the model just answers the plain \boxed{} prompt and reasons freely to 16384.
+# Use this for:
+#   - untrained bases (default: DeepSeek-R1-Distill-Qwen-1.5B)
+#   - released AdaptThink HF checkpoints (Think / NoThink is already in the policy)
 #
-# Override: AIME_N=16, MATH500_N=5, GSM8K_N=5, DATA_ROOT=$PWD/data
-# Logs: eval_bench_{aime,math500,gsm8k}_base.log
+# Routing stays OFF: AdaptThink does not emit NOTHINK/SHORT/LONG. Injecting our
+# routing question would not be a fair comparison.
+#
+# Examples:
+#   sbatch scripts/eval_hf_no_routing.job
+#   MODEL=THU-KEG/AdaptThink-1.5B-delta0.05 TAG=adaptthink_1p5b_d005 \
+#     sbatch scripts/eval_hf_no_routing.job
+#   MODEL=THU-KEG/AdaptThink-7B-delta0.05 TAG=adaptthink_7b_d005 \
+#     ROLLOUT_TP_SIZE=2 GPU_MEM_UTIL=0.4 sbatch scripts/eval_hf_no_routing.job
+#   MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B TAG=base_7b \
+#     ROLLOUT_TP_SIZE=2 GPU_MEM_UTIL=0.4 sbatch scripts/eval_hf_no_routing.job
 
-#SBATCH --job-name=eval_benchmarks_baseline
+#SBATCH --job-name=eval_hf_no_routing
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
@@ -27,35 +35,37 @@ module load 2025
 module load CUDA/12.8.0
 
 source ~/.bashrc
+eval "$(conda shell.bash hook 2>/dev/null)" || true
 conda activate zero
+
+set -uo pipefail
 
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
 
 export HF_HOME=/scratch-shared/$USER/huggingface
-mkdir -p $HF_HOME
+mkdir -p "$HF_HOME"
 export WANDB__SERVICE_WAIT=300
 export WANDB_DIR=/scratch-shared/$USER/wandb
-mkdir -p $WANDB_DIR
+mkdir -p "$WANDB_DIR"
 
 cd "${REPO_DIR:-$HOME/three-mode-routing}"
 # shellcheck source=scripts/paper_protocol.sh
 source "${REPO_DIR:-$PWD}/scripts/paper_protocol.sh"
+paper_require_python
 
 export N_GPUS=${N_GPUS:-4}
 export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
 export GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.5}
-export BASE_MODEL=${BASE_MODEL:-$PAPER_BASE_MODEL_1P5B}
+
+MODEL=${MODEL:-$PAPER_ADAPTTHINK_1P5B}
+TAG=${TAG:-adaptthink_1p5b_d005}
 
 DATA_ROOT=${DATA_ROOT:-"$PWD/data"}
 AIME_N=${AIME_N:-$PAPER_AIME_N}
 MATH500_N=${MATH500_N:-$PAPER_MATH500_N}
 GSM8K_N=${GSM8K_N:-$PAPER_GSM8K_N}
-STEP="base"
 
-echo "BASELINE (no routing, plain prompt, 16k): $BASE_MODEL | AIME n=$AIME_N | MATH500 n=$MATH500_N | GSM8K n=$GSM8K_N"
-
-# Dummy (never-iterated) train dataloader; large file so val_only's non-empty assert passes.
 DUMMY_TRAIN="$DATA_ROOT/gsm8k/train.parquet"
 paper_require_file "$DUMMY_TRAIN"
 paper_require_file "$DATA_ROOT/aime2024/dev.parquet"
@@ -63,27 +73,31 @@ paper_require_file "$DATA_ROOT/aime2025/dev.parquet"
 paper_require_file "$DATA_ROOT/math_lighteval/dev.parquet"
 paper_require_file "$DATA_ROOT/gsm8k/dev.parquet"
 
-# Args: <bench_tag> <val_files Hydra value> <n>
+echo "HF no-routing eval: MODEL=$MODEL TAG=$TAG TP=$ROLLOUT_TP_SIZE util=$GPU_MEM_UTIL"
+echo "protocol: temp=$PAPER_VAL_TEMPERATURE top_p=$PAPER_VAL_TOP_P max_resp=$PAPER_MAX_RESPONSE_LENGTH"
+echo "n: AIME=$AIME_N MATH500=$MATH500_N GSM8K=$GSM8K_N"
+
 run_eval () {
-    local TAG="$1" VAL_FILES="$2" N="$3"
-    local LOG="eval_bench_${TAG}_${STEP}.log"
-    local EXP="eval_bench_${TAG}_${STEP}"
-    echo ">>> $TAG : val_files=$VAL_FILES  n=$N  -> $LOG"
+    local BENCH="$1" VAL_FILES="$2" N="$3"
+    local LOG="eval_bench_${BENCH}_${TAG}.log"
+    local EXP="eval_hf_${TAG}_${BENCH}"
+    echo ">>> $BENCH : val_files=$VAL_FILES  n=$N  -> $LOG"
     python3 -m verl.trainer.main_ppo \
         data.train_files="$DUMMY_TRAIN" \
         "data.val_files=$VAL_FILES" \
         data.train_batch_size=256 \
-        data.val_batch_size=1000 \
+        data.val_batch_size=$PAPER_VAL_ONLY_BATCH_SIZE \
         data.dataloader_num_workers=2 \
         data.max_prompt_length=$PAPER_MAX_PROMPT_LENGTH \
         data.max_response_length=$PAPER_MAX_RESPONSE_LENGTH \
-        actor_rollout_ref.model.path=$BASE_MODEL \
+        actor_rollout_ref.model.path="$MODEL" \
         actor_rollout_ref.model.use_remove_padding=True \
+        +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
         actor_rollout_ref.actor.use_dynamic_bsz=True \
-        actor_rollout_ref.actor.optim.lr=1e-6 \
-        actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-        actor_rollout_ref.actor.ppo_micro_batch_size=8 \
-        actor_rollout_ref.actor.loss_agg_mode=token-mean \
+        actor_rollout_ref.actor.optim.lr=$PAPER_ACTOR_LR \
+        actor_rollout_ref.actor.ppo_mini_batch_size=$PAPER_PPO_MINI_BATCH_SIZE \
+        actor_rollout_ref.actor.ppo_micro_batch_size=$PAPER_PPO_MICRO_BATCH_SIZE \
+        actor_rollout_ref.actor.loss_agg_mode=$PAPER_LOSS_AGG_MODE \
         actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
         actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
         actor_rollout_ref.rollout.n=4 \
@@ -101,6 +115,7 @@ run_eval () {
         algorithm.adv_estimator=grpo \
         algorithm.norm_adv_by_std_in_grpo=False \
         algorithm.use_kl_in_reward=False \
+        algorithm.three_mode_routing.enable=False \
         trainer.n_gpus_per_node=$N_GPUS \
         trainer.nnodes=1 \
         trainer.resume_mode=disable \
@@ -116,35 +131,32 @@ run_eval () {
         2>&1 | tee "$LOG"
     local rc=${PIPESTATUS[0]}
     if [ "$rc" -ne 0 ]; then
-        echo "!!! $TAG eval FAILED (exit $rc) — see $LOG"
+        echo "!!! $BENCH eval FAILED (exit $rc) — see $LOG"
     else
-        echo "<<< $TAG eval OK"
+        echo "<<< $BENCH eval OK"
     fi
 }
 
-# ── AIME 2024 + 2025 together @ n=16 ─────────────────────────────────────────────
 run_eval "aime" \
     "[$DATA_ROOT/aime2024/dev.parquet,$DATA_ROOT/aime2025/dev.parquet]" \
     "$AIME_N"
 
-# ── MATH-500 @ n=5 ──────────────────────────────────────────────────────────────
 run_eval "math500" \
     "$DATA_ROOT/math_lighteval/dev.parquet" \
     "$MATH500_N"
 
-# ── GSM8K @ n=5 ─────────────────────────────────────────────────────────────────
 run_eval "gsm8k" \
     "$DATA_ROOT/gsm8k/dev.parquet" \
     "$GSM8K_N"
 
 echo ""
-echo "=== SUMMARY (baseline acc per benchmark) ==="
+echo "=== SUMMARY (acc per benchmark, tag=$TAG) ==="
 grep -hoP "val-core/[^ ]*acc/mean@\d+:[0-9.]+" \
-    eval_bench_aime_${STEP}.log \
-    eval_bench_math500_${STEP}.log \
-    eval_bench_gsm8k_${STEP}.log 2>/dev/null | sort -u
+    eval_bench_aime_${TAG}.log \
+    eval_bench_math500_${TAG}.log \
+    eval_bench_gsm8k_${TAG}.log 2>/dev/null | sort -u
 echo "=== SUMMARY (mean response length) ==="
 grep -hE "val-aux/response_length/mean:|val-lengths/response/mean:" \
-    eval_bench_aime_${STEP}.log \
-    eval_bench_math500_${STEP}.log \
-    eval_bench_gsm8k_${STEP}.log 2>/dev/null
+    eval_bench_aime_${TAG}.log \
+    eval_bench_math500_${TAG}.log \
+    eval_bench_gsm8k_${TAG}.log 2>/dev/null
