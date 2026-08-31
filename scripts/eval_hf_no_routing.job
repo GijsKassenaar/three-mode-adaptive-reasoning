@@ -19,6 +19,8 @@
 #     sbatch scripts/eval_hf_no_routing.job
 #   MODEL=THU-KEG/AdaptThink-7B-delta0.05 TAG=adaptthink_7b_d005 \
 #     ROLLOUT_TP_SIZE=2 GPU_MEM_UTIL=0.4 sbatch scripts/eval_hf_no_routing.job
+#   MODEL=SONGJUNTU/Distill-R1-1.5B-AutoThink-Stage3 TAG=autothink_1p5b_s3 \
+#     sbatch scripts/eval_hf_no_routing.job
 #   MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B TAG=base_7b \
 #     ROLLOUT_TP_SIZE=2 GPU_MEM_UTIL=0.4 sbatch scripts/eval_hf_no_routing.job
 

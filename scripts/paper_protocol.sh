@@ -53,6 +53,7 @@ PAPER_BASE_MODEL_7B=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 # we keep top_p=1.0 to match our other tables.
 PAPER_ADAPTTHINK_1P5B=THU-KEG/AdaptThink-1.5B-delta0.05
 PAPER_ADAPTTHINK_7B=THU-KEG/AdaptThink-7B-delta0.05
+PAPER_AUTOTHINK_1P5B=SONGJUNTU/Distill-R1-1.5B-AutoThink-Stage3
 
 paper_require_file() {
     local path="$1"
