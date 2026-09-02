@@ -89,7 +89,9 @@ paper protocol (temp 0.6, top_p 1.0, max 16384, boxed scorer). FSDP used
 SDPA (`+actor_rollout_ref.model.override_config.attn_implementation=sdpa`);
 standalone flash-attn 2.8.3 was not used because it broke vLLM.
 
-Logs on the cluster checkout: `eval_bench_{aime,math500,gsm8k}_adaptthink_1p5b_d005.log`.
+Logs (committed): `docs/results/logs/eval_bench_{aime,math500,gsm8k}_adaptthink_1p5b_d005.log`.
+Table cells: `python3 scripts/parse_eval_bench_logs.py` → `docs/results/related_work.json`.
+Generation seed is unset (`seed: None`); `data_loader_seed` is 42. AIME n=30 with n=16 samples is noisy.
 
 MATH-500 L1–L5 acc (AdaptThink only): 0.921 / 0.833 / 0.874 / 0.784 / 0.639.
 AIME 12.1% truncated at 16k.
@@ -103,7 +105,7 @@ already contains the ellipsis (`<think>\n...\n`); we do not inject
 **method + checkpoint** comparison. Their original eval uses top_p=0.95 and
 32k context; we keep top_p=1.0 and 16k.
 
-Logs: `eval_bench_{aime,math500,gsm8k}_autothink_1p5b_s3.log`.
+Logs (committed): `docs/results/logs/eval_bench_{aime,math500,gsm8k}_autothink_1p5b_s3.log`.
 
 MATH-500 L1–L5 acc: 0.907 / 0.876 / 0.882 / 0.811 / 0.693.
 AIME 11.3% truncated at 16k. AIME length is one pooled mean over 2024+2025.
