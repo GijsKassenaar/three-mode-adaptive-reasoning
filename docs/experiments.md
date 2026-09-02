@@ -15,6 +15,13 @@ bash scripts/prepare_benchmarks.sh
 That writes `data/math_lighteval/{train,dev}.parquet` (train = MATH-lighteval,
 dev = MATH-500) and `data/{gsm8k,aime2024,aime2025}/`.
 
+MATH-lighteval is loaded from Hub parquet (`DigitalLearningGmbH/MATH-lighteval`,
+default config, 7500/5000). No loading script and no `trust_remote_code`. Confirmed
+on `datasets` 4.3.0: `load_dataset(...)` regenerates the splits; passing
+`trust_remote_code=True` only logs an error (datasets 4.x and 5.0.1) and is not
+required. A current `pip install datasets` is enough for prep; we do not pin a
+legacy 2.x line. The Hub repo has no loading script.
+
 ---
 
 ## Shared protocol (must stay aligned)
