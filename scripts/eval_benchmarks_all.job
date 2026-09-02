@@ -40,16 +40,19 @@ export WANDB_DIR=/scratch-shared/$USER/wandb
 mkdir -p $WANDB_DIR
 
 cd "${REPO_DIR:-$HOME/three-mode-routing}"
+# shellcheck source=scripts/paper_protocol.sh
+source "${REPO_DIR:-$PWD}/scripts/paper_protocol.sh"
 
-export N_GPUS=4
-export ROLLOUT_TP_SIZE=1
-export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+export N_GPUS=${N_GPUS:-4}
+export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
+export GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.5}
+export BASE_MODEL=${BASE_MODEL:-$PAPER_BASE_MODEL_1P5B}
 
 DATA_ROOT=${DATA_ROOT:-"$PWD/data"}
-VAL_MODE=${VAL_MODE:-"LONG"}
-AIME_N=${AIME_N:-16}
-MATH500_N=${MATH500_N:-5}
-GSM8K_N=${GSM8K_N:-5}
+VAL_MODE=${VAL_MODE:-"FREE"}
+AIME_N=${AIME_N:-$PAPER_AIME_N}
+MATH500_N=${MATH500_N:-$PAPER_MATH500_N}
+GSM8K_N=${GSM8K_N:-$PAPER_GSM8K_N}
 
 # Checkpoint override priority: positional arg $1 > env CHECKPOINT > default.
 # Use the POSITIONAL form ('sbatch eval_benchmarks_all.job <ckpt>') — SLURM always forwards
@@ -72,6 +75,11 @@ echo "Checkpoint: $CHECKPOINT (step $STEP) | mode: $VAL_MODE | AIME n=$AIME_N | 
 # crash with "Train dataloader is empty!". So point the dummy train at a large file (gsm8k
 # train, 7473 rows) for ALL passes — it is loaded but never used for val_only.
 DUMMY_TRAIN="$DATA_ROOT/gsm8k/train.parquet"
+paper_require_file "$DUMMY_TRAIN"
+paper_require_file "$DATA_ROOT/aime2024/dev.parquet"
+paper_require_file "$DATA_ROOT/aime2025/dev.parquet"
+paper_require_file "$DATA_ROOT/math_lighteval/dev.parquet"
+paper_require_file "$DATA_ROOT/gsm8k/dev.parquet"
 
 # ── Common val-only invocation. Args: <bench_tag> <val_files Hydra value> <n>
 run_eval () {
@@ -85,8 +93,8 @@ run_eval () {
         data.train_batch_size=256 \
         data.val_batch_size=1000 \
         data.dataloader_num_workers=2 \
-        data.max_prompt_length=2048 \
-        data.max_response_length=16384 \
+        data.max_prompt_length=$PAPER_MAX_PROMPT_LENGTH \
+        data.max_response_length=$PAPER_MAX_RESPONSE_LENGTH \
         actor_rollout_ref.model.path=$BASE_MODEL \
         actor_rollout_ref.model.use_remove_padding=True \
         actor_rollout_ref.actor.use_dynamic_bsz=True \
@@ -97,13 +105,14 @@ run_eval () {
         actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
         actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
         actor_rollout_ref.rollout.n=4 \
-        actor_rollout_ref.rollout.prompt_length=2048 \
+        actor_rollout_ref.rollout.prompt_length=$PAPER_MAX_PROMPT_LENGTH \
         actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
         actor_rollout_ref.rollout.name=vllm \
-        actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+        actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEM_UTIL \
         actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
-        actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
-        actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+        actor_rollout_ref.rollout.val_kwargs.temperature=$PAPER_VAL_TEMPERATURE \
+        actor_rollout_ref.rollout.val_kwargs.top_p=$PAPER_VAL_TOP_P \
+        actor_rollout_ref.rollout.val_kwargs.do_sample=$PAPER_VAL_DO_SAMPLE \
         actor_rollout_ref.rollout.val_kwargs.n=$N \
         actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
         critic.enable=False \
@@ -114,9 +123,9 @@ run_eval () {
         algorithm.three_mode_routing.nothink_token=NOTHINK \
         algorithm.three_mode_routing.short_token=SHORT \
         algorithm.three_mode_routing.long_token=LONG \
-        algorithm.three_mode_routing.nothink_max_tokens=1024 \
-        algorithm.three_mode_routing.short_max_tokens=3000 \
-        algorithm.three_mode_routing.long_max_tokens=16384 \
+        algorithm.three_mode_routing.nothink_max_tokens=$PAPER_NOTHINK_CAP \
+        algorithm.three_mode_routing.short_max_tokens=$PAPER_SHORT_CAP \
+        algorithm.three_mode_routing.long_max_tokens=$PAPER_LONG_CAP \
         "algorithm.three_mode_routing.val_forced_mode=${VAL_MODE,,}" \
         trainer.n_gpus_per_node=$N_GPUS \
         trainer.nnodes=1 \
@@ -161,3 +170,8 @@ grep -hoP "val-core/[^ ]*acc/mean@\d+:[0-9.]+" \
     eval_bench_aime_${VAL_MODE}_step${STEP}.log \
     eval_bench_math500_${VAL_MODE}_step${STEP}.log \
     eval_bench_gsm8k_${VAL_MODE}_step${STEP}.log 2>/dev/null | sort -u
+echo "=== SUMMARY (mean response length) ==="
+grep -hE "val-aux/response_length/mean:|val-lengths/response/mean:" \
+    eval_bench_aime_${VAL_MODE}_step${STEP}.log \
+    eval_bench_math500_${VAL_MODE}_step${STEP}.log \
+    eval_bench_gsm8k_${VAL_MODE}_step${STEP}.log 2>/dev/null

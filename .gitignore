@@ -132,5 +132,8 @@ outputs
 # three-mode-routing: generated data, run logs, checkpoints
 data/
 *.log
+# Committed related-work eval traces (Vincent review PART A)
+!docs/results/logs/
+!docs/results/logs/*.log
 slurm-*.out
 wandb/

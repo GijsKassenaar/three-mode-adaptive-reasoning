@@ -1,0 +1,144 @@
+{
+  "protocol": "scripts/paper_protocol.sh via scripts/eval_hf_no_routing.job",
+  "routing": "off",
+  "runs": {
+    "adaptthink_1p5b_d005": {
+      "display": "AdaptThink-1.5B \u03b4=0.05",
+      "checkpoint": "THU-KEG/AdaptThink-1.5B-delta0.05",
+      "tag": "adaptthink_1p5b_d005",
+      "table": {
+        "math500_acc": 0.785,
+        "gsm8k_acc": 0.829,
+        "aime2024_acc": 0.281,
+        "aime2025_acc": 0.219,
+        "length_math": 1464,
+        "length_gsm8k": 638,
+        "length_aime_pooled": 7212
+      },
+      "raw": {
+        "math500": {
+          "log": "docs/results/logs/eval_bench_math500_adaptthink_1p5b_d005.log",
+          "acc": {
+            "DigitalLearningGmbH/MATH-lighteval": {
+              "n": 5,
+              "mean": 0.7847999999999999
+            }
+          },
+          "response_length_mean": 1464.3468017578125,
+          "truncated_by_length_fraction": 0.0096,
+          "generation_seed": null,
+          "data_loader_seed": 42,
+          "do_sample": true,
+          "temperature": 0.6
+        },
+        "gsm8k": {
+          "log": "docs/results/logs/eval_bench_gsm8k_adaptthink_1p5b_d005.log",
+          "acc": {
+            "gsm8k": {
+              "n": 5,
+              "mean": 0.8289613343442003
+            }
+          },
+          "response_length_mean": 638.4603271484375,
+          "truncated_by_length_fraction": 0.00030326004548900684,
+          "generation_seed": null,
+          "data_loader_seed": 42,
+          "do_sample": true,
+          "temperature": 0.6
+        },
+        "aime": {
+          "log": "docs/results/logs/eval_bench_aime_adaptthink_1p5b_d005.log",
+          "acc": {
+            "aime2024": {
+              "n": 16,
+              "mean": 0.28125
+            },
+            "aime2025": {
+              "n": 16,
+              "mean": 0.21875
+            }
+          },
+          "response_length_mean": 7211.60400390625,
+          "truncated_by_length_fraction": 0.12083333333333333,
+          "generation_seed": null,
+          "data_loader_seed": 42,
+          "do_sample": true,
+          "temperature": 0.6
+        }
+      },
+      "notes": {
+        "aime_length": "one pooled mean over aime2024+aime2025; per-year acc is in raw.aime.acc",
+        "generation_seed": "vLLM generation seed is None (do_sample=True, temp 0.6). AIME n=30 is noisy."
+      }
+    },
+    "autothink_1p5b_s3": {
+      "display": "AutoThink-1.5B Stage3",
+      "checkpoint": "SONGJUNTU/Distill-R1-1.5B-AutoThink-Stage3",
+      "tag": "autothink_1p5b_s3",
+      "table": {
+        "math500_acc": 0.814,
+        "gsm8k_acc": 0.843,
+        "aime2024_acc": 0.367,
+        "aime2025_acc": 0.26,
+        "length_math": 2093,
+        "length_gsm8k": 659,
+        "length_aime_pooled": 8112
+      },
+      "raw": {
+        "math500": {
+          "log": "docs/results/logs/eval_bench_math500_autothink_1p5b_s3.log",
+          "acc": {
+            "DigitalLearningGmbH/MATH-lighteval": {
+              "n": 5,
+              "mean": 0.814
+            }
+          },
+          "response_length_mean": 2093.49072265625,
+          "truncated_by_length_fraction": 0.0152,
+          "generation_seed": null,
+          "data_loader_seed": 42,
+          "do_sample": true,
+          "temperature": 0.6
+        },
+        "gsm8k": {
+          "log": "docs/results/logs/eval_bench_gsm8k_autothink_1p5b_s3.log",
+          "acc": {
+            "gsm8k": {
+              "n": 5,
+              "mean": 0.843366186504928
+            }
+          },
+          "response_length_mean": 658.97314453125,
+          "truncated_by_length_fraction": 0.0009097801364670204,
+          "generation_seed": null,
+          "data_loader_seed": 42,
+          "do_sample": true,
+          "temperature": 0.6
+        },
+        "aime": {
+          "log": "docs/results/logs/eval_bench_aime_autothink_1p5b_s3.log",
+          "acc": {
+            "aime2024": {
+              "n": 16,
+              "mean": 0.36666666666666664
+            },
+            "aime2025": {
+              "n": 16,
+              "mean": 0.2604166666666667
+            }
+          },
+          "response_length_mean": 8112.24365234375,
+          "truncated_by_length_fraction": 0.1125,
+          "generation_seed": null,
+          "data_loader_seed": 42,
+          "do_sample": true,
+          "temperature": 0.6
+        }
+      },
+      "notes": {
+        "aime_length": "one pooled mean over aime2024+aime2025; per-year acc is in raw.aime.acc",
+        "generation_seed": "vLLM generation seed is None (do_sample=True, temp 0.6). AIME n=30 is noisy."
+      }
+    }
+  }
+}

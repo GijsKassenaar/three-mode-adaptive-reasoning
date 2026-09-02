@@ -124,6 +124,24 @@ sbatch scripts/eval_benchmarks_all.job <ckpt_dir>/global_step_90
 sbatch scripts/eval_benchmarks_baseline.job      # untrained base model reference
 ```
 
+### AdaptThink comparison and 7B scale-up
+
+See [docs/experiments.md](docs/experiments.md) for the matched protocol, jobs, and
+what to report. Shared constants live in `scripts/paper_protocol.sh`.
+
+```bash
+# Released AdaptThink-1.5B (δ=0.05), no routing question, paper eval protocol:
+MODEL=THU-KEG/AdaptThink-1.5B-delta0.05 TAG=adaptthink_1p5b_d005 \
+  sbatch scripts/eval_hf_no_routing.job
+
+# AutoThink Stage 3, same no-routing protocol:
+MODEL=SONGJUNTU/Distill-R1-1.5B-AutoThink-Stage3 TAG=autothink_1p5b_s3 \
+  sbatch scripts/eval_hf_no_routing.job
+
+# One 7B seed, same two-phase recipe as the 1.5B MATH run:
+sbatch scripts/train_three_mode_routing_math_7b.job
+```
+
 The per-difficulty routing-split figure is produced from any training/eval log with:
 
 ```bash
